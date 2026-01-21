@@ -69,7 +69,21 @@ def load_cnn(model, state_dict, prefix, expand=False, use_linear=False):
     return model, state_dict, loaded_keys
 
 
-def vae_model(vqgan_ckpt, schedule_mode, codebook_dim, codebook_size, test_mode=True, patch_size=16, encoder_ch_mult=[1, 2, 4, 4, 4], decoder_ch_mult=[1, 2, 4, 4, 4],):
+def vae_model(
+    vqgan_ckpt,
+    schedule_mode,
+    codebook_dim,
+    codebook_size,
+    test_mode=True,
+    patch_size=16,
+    encoder_ch_mult=[1, 2, 4, 4, 4],
+    decoder_ch_mult=[1, 2, 4, 4, 4],
+    # --- ARPC extensions (optional) ---
+    gm_active_bits_per_scale=None,
+    srd_prob: float = 0.0,
+    srd_start_scale: int = 3,
+    srd_mode: str = "level",
+):
     args=argparse.Namespace(
         vqgan_ckpt=vqgan_ckpt,
         sd_ckpt=None,
@@ -140,6 +154,11 @@ def vae_model(vqgan_ckpt, schedule_mode, codebook_dim, codebook_size, test_mode=
         drop_when_test=False,
         drop_lvl_idx=0,
         drop_lvl_num=1,
+        # --- ARPC extensions (optional) ---
+        gm_active_bits_per_scale=gm_active_bits_per_scale,
+        srd_prob=0.0 if test_mode else float(srd_prob),
+        srd_start_scale=int(srd_start_scale),
+        srd_mode=str(srd_mode),
         disc_version='v1',
         magvit_disc=False,
         sigmoid_in_disc=False,

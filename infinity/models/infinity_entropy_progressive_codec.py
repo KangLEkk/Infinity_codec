@@ -43,22 +43,31 @@ def pack_bits_to_uint(bits: torch.Tensor) -> torch.Tensor:
     bits: (..., d) int/bool
     returns: (...) uint64
     """
-    if bits.dtype != torch.uint8 and bits.dtype != torch.int64 and bits.dtype != torch.int32 and bits.dtype != torch.bool:
-        bits = bits.to(torch.int64)
+    if bits.dtype not in (torch.uint8, torch.int64, torch.int32, torch.bool, torch.uint64):
+        bits = bits.to(torch.uint64)
     else:
-        bits = bits.to(torch.int64)
+        bits = bits.to(torch.uint64)    
     d = bits.shape[-1]
+    if d > 64:
+        raise ValueError(f"Bit depth {d} exceeds uint64 packing capacity.")
     # Use MSB-first packing for consistency
-    weights = (2 ** torch.arange(d - 1, -1, -1, device=bits.device, dtype=torch.int64))
+    # weights = (2 ** torch.arange(d - 1, -1, -1, device=bits.device, dtype=torch.int64))
+    shifts = torch.arange(d - 1, -1, -1, device=bits.device, dtype=torch.uint64)
+    weights = torch.bitwise_left_shift(torch.ones_like(shifts), shifts)
     return (bits * weights).sum(dim=-1).to(torch.uint64)
 
 
 @torch.no_grad()
 def unpack_uint_to_bits(vals: torch.Tensor, d: int) -> torch.Tensor:
     """Unpack uint64 into bits (0/1) along last dimension."""
-    vals64 = vals.to(torch.int64)
-    weights = (2 ** torch.arange(d - 1, -1, -1, device=vals.device, dtype=torch.int64))
-    bits = (vals64.unsqueeze(-1) // weights) % 2
+    # vals64 = vals.to(torch.int64)
+    # weights = (2 ** torch.arange(d - 1, -1, -1, device=vals.device, dtype=torch.int64))
+    # bits = (vals64.unsqueeze(-1) // weights) % 2
+    if d > 64:
+        raise ValueError(f"Bit depth {d} exceeds uint64 packing capacity.")
+    vals64 = vals.to(torch.uint64)
+    shifts = torch.arange(d - 1, -1, -1, device=vals.device, dtype=torch.uint64)
+    bits = torch.bitwise_and(torch.bitwise_right_shift(vals64.unsqueeze(-1), shifts), 1)
     return bits.to(torch.uint8)
 
 
@@ -194,6 +203,8 @@ class InfinityEntropyProgressiveCodec:
 
         for s in range(num_scales):
             bits = bitidx_per_scale[s]  # [1,1,H,W,d]
+            if bits.shape[0] != 1 or bits.shape[1] != 1:
+                raise ValueError(f"compress expects B=1,T=1, got {tuple(bits.shape[:2])} at scale {s}.")
             H, W = int(bits.shape[2]), int(bits.shape[3])
 
             tokens_uint = pack_bits_to_uint(bits[0, 0])  # [H,W] uint64
@@ -267,7 +278,8 @@ class InfinityEntropyProgressiveCodec:
 
             bits_hw_d = unpack_uint_to_bits(tokens_uint, d=d)  # [H,W,d]
             forced_bits_list.append(bits_hw_d.unsqueeze(0).unsqueeze(0))  # [1,1,H,W,d]
-            forced_mask_list.append(mask.unsqueeze(0))  # [1,H,W]
+            # forced_mask_list.append(mask.unsqueeze(0))  # [1,H,W]
+            forced_mask_list.append(mask.unsqueeze(0).unsqueeze(0))  # [1,1,H,W]
 
         reader.close()
 
@@ -275,6 +287,11 @@ class InfinityEntropyProgressiveCodec:
             cfg_list = [1.0] * len(self.scale_schedule)
         if tau_list is None:
             tau_list = [1.0] * len(self.scale_schedule)
+
+        if hasattr(self.model, "parameters"):
+            device = next(self.model.parameters()).device
+            forced_bits_list = [bits.to(device) for bits in forced_bits_list]
+            forced_mask_list = [mask.to(device) for mask in forced_mask_list]
 
         out = self.model.autoregressive_infer_cfg(
             vae=self.vae,

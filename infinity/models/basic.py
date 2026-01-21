@@ -6,7 +6,7 @@ import math
 import os
 from functools import partial
 from typing import Optional, Tuple, Union
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +33,58 @@ except ImportError:
     
     def rms_norm_impl(x, weight, epsilon):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
+
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1]
+    x1 = x[..., : d // 2]
+    x2 = x[..., d // 2 :]
+    return torch.cat([-x2, x1], dim=-1)
+
+def _build_rope2d_cos_sin(h: int, w: int, dim: int, device, dtype, rope2d_normalized_by_hw: int = 2):
+    """
+    Build 2D RoPE cos/sin for a grid h*w with head_dim=dim.
+    Output shape: [1,1,h*w,dim]
+    """
+    assert dim % 4 == 0 or dim % 2 == 0, f"head_dim={dim} must be even (better divisible by 4)."
+
+    # split dim into (y-part, x-part)
+    dim_each = dim // 2
+    # standard RoPE base
+    base = 10000.0
+
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim_each, 2, device=device, dtype=torch.float32) / dim_each))
+
+    yy = torch.arange(h, device=device, dtype=torch.float32)
+    xx = torch.arange(w, device=device, dtype=torch.float32)
+
+    # normalize positions (Infinity uses rope2d_normalized_by_hw=2 commonly)
+    if rope2d_normalized_by_hw == 2:
+        if h > 1:
+            yy = yy / (h - 1)
+        if w > 1:
+            xx = xx / (w - 1)
+
+    # angles: [H, dim_each/2] and [W, dim_each/2]
+    ang_y = torch.einsum("i,j->ij", yy, inv_freq)
+    ang_x = torch.einsum("i,j->ij", xx, inv_freq)
+
+    # expand to dim_each by repeating each freq twice
+    cos_y = torch.repeat_interleave(torch.cos(ang_y), 2, dim=-1)  # [H, dim_each]
+    sin_y = torch.repeat_interleave(torch.sin(ang_y), 2, dim=-1)
+    cos_x = torch.repeat_interleave(torch.cos(ang_x), 2, dim=-1)  # [W, dim_each]
+    sin_x = torch.repeat_interleave(torch.sin(ang_x), 2, dim=-1)
+
+    # build grid: [H,W,dim_each] for y and x, then concat -> [H,W,dim]
+    cos_y_grid = cos_y[:, None, :].expand(h, w, dim_each)
+    sin_y_grid = sin_y[:, None, :].expand(h, w, dim_each)
+    cos_x_grid = cos_x[None, :, :].expand(h, w, dim_each)
+    sin_x_grid = sin_x[None, :, :].expand(h, w, dim_each)
+
+    cos = torch.cat([cos_y_grid, cos_x_grid], dim=-1).reshape(1, 1, h * w, dim).to(dtype=dtype)
+    sin = torch.cat([sin_y_grid, sin_x_grid], dim=-1).reshape(1, 1, h * w, dim).to(dtype=dtype)
+    return cos, sin
 
 
 def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_by_hw, pad_to_multiplier=1, max_height=2048 // 16, max_width=2048 // 16, base=10000.0, device=None, scaling_factor=1.0):
@@ -103,6 +155,32 @@ def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier,
         if scale_ind >= 1:
             assert len(scale_schedule[0]) == 3
             start = np.sum([item[0] * item[1] * item[2] for item in scale_schedule[:scale_ind]])
+        key = str(tuple(scale_schedule))
+        if key not in rope2d_freqs_grid:
+            # ✅ 未缓存的 schedule：现场计算 2D RoPE 并直接用（不查 rope2d_freqs_grid）
+            _, hh, ww = scale_schedule[scale_ind]
+            cos, sin = _build_rope2d_cos_sin(
+                hh, ww,
+                dim=q.shape[-1],
+                device=q.device,
+                dtype=q.dtype,
+                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+            )
+
+            # 如果 attention 序列长度 L > hh*ww（可能有 padding），补齐 cos/sin
+            L = q.shape[-2]
+            hw = hh * ww
+            if L > hw:
+                pad = L - hw
+                cos_pad = torch.ones((1, 1, pad, q.shape[-1]), device=q.device, dtype=q.dtype)
+                sin_pad = torch.zeros((1, 1, pad, q.shape[-1]), device=q.device, dtype=q.dtype)
+                cos = torch.cat([cos, cos_pad], dim=2)
+                sin = torch.cat([sin, sin_pad], dim=2)
+
+            q = q * cos + _rotate_half(q) * sin
+            k = k * cos + _rotate_half(k) * sin
+            return q, k
+
         rope2d_freqs_grid[str(tuple(scale_schedule))] = rope2d_freqs_grid[str(tuple(scale_schedule))].to(qk.device)
         assert start+seq_len <= rope2d_freqs_grid[str(tuple(scale_schedule))].shape[4]
         rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][:, :, :, :, start:start+seq_len] # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]

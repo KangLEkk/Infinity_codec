@@ -471,6 +471,7 @@ class Infinity(nn.Module):
         forced_bitidx_per_scale=None,
         forced_mask_per_scale=None,
         return_logits_per_scale=False,
+        do_sample=True,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -578,15 +579,20 @@ class Infinity(nn.Module):
                 logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
             
             if return_logits_per_scale:
-                logits_per_scale.append(logits_BlV.detach())
+                logits_per_scale.append(logits_BlV.detach().clone())
 
-            if self.use_bit_label:
-                tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
-                logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
-                idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
-                idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
+            if do_sample:
+                if self.use_bit_label:
+                    tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
+                    logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
+                    idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                    idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
+                else:
+                    idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
             else:
-                idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                # --- 确定性补全：greedy / argmax ---
+                idx_Bld = logits_BlV.argmax(dim=-1)
+
             if vae_type != 0:
                 assert returns_vemb
                 if si < gt_leak:

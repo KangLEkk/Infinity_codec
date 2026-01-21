@@ -22,6 +22,7 @@ from infinity.utils.misc import os_system
 def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash=False, device='cuda'):
     if args.vae_type in [8,16,18,20,24,32,64,128]:
         from infinity.models.bsq_vae.vae import vae_model
+        from infinity.utils.arpc_util import parse_active_bits_spec
         schedule_mode = "dynamic"
         codebook_dim = args.vae_type # 18
         codebook_size = 2**codebook_dim
@@ -33,8 +34,22 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
             patch_size = 16
             encoder_ch_mult=[1, 2, 4, 4, 4]
             decoder_ch_mult=[1, 2, 4, 4, 4]
-        vae_local = vae_model(vae_st, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size, 
-                              encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True).to(args.device)
+        gm_bits = parse_active_bits_spec(getattr(args, 'arpc_gm_bits', ''), codebook_dim)
+        vae_local = vae_model(
+            vae_st,
+            schedule_mode,
+            codebook_dim,
+            codebook_size,
+            patch_size=patch_size,
+            encoder_ch_mult=encoder_ch_mult,
+            decoder_ch_mult=decoder_ch_mult,
+            test_mode=True,
+            gm_active_bits_per_scale=gm_bits,
+            # SRD is training-only; vae_model will force it to 0 in test_mode
+            srd_prob=getattr(args, 'arpc_srd_prob', 0.0),
+            srd_start_scale=getattr(args, 'arpc_srd_start_scale', 3),
+            srd_mode=getattr(args, 'arpc_srd_mode', 'level'),
+        ).to(args.device)
         if args.fake_vae_input:
             vae_local.encoder = None
             vae_local.decoder = None

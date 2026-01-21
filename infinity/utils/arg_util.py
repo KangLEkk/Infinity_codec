@@ -20,6 +20,16 @@ class Args(Tap):
     data_path: str = ''                 # dataset
     bed: str = ''                       # bed directory for copy checkpoints apart from local_out_path
     vae_ckpt: str = ''                  # VAE ckpt
+    # --- ARPC optional knobs (GM-BMSRQ / SRD) ---
+    # GM-BMSRQ: active bits/channels per scale.
+    #   "" / "none" -> disabled (original Infinity behavior)
+    #   "default" -> paper default: 8x4,12x5,16x4 for c=16 (or 16x4,24x5,32x4 for c=32)
+    #   "8x4,12x5,16x4" or explicit list also supported
+    arpc_gm_bits: str = ''
+    # SRD is training-only; kept here so scripts can pass it uniformly.
+    arpc_srd_prob: float = 0.0
+    arpc_srd_start_scale: int = 3
+    arpc_srd_mode: str = 'level'
     exp_name: str = ''                  # experiment name
     ds: str = 'oi'                      # only used in GPT training::load_viz_data & FID benchmark
     model: str = ''                     # for VAE training, 'b' or any other for GPT training

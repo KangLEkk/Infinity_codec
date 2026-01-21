@@ -475,6 +475,11 @@ class AutoEncoder(nn.Module):
                     drop_when_test = args.drop_when_test,
                     drop_lvl_idx = args.drop_lvl_idx,
                     drop_lvl_num = args.drop_lvl_num,
+                    # --- ARPC extensions (optional) ---
+                    gm_active_bits_per_scale=getattr(args, 'gm_active_bits_per_scale', None),
+                    srd_prob=float(getattr(args, 'srd_prob', 0.0)),
+                    srd_start_scale=int(getattr(args, 'srd_start_scale', 3)),
+                    srd_mode=str(getattr(args, 'srd_mode', 'level')),
                 )
                 self.quantize = self.quantizer
                 self.vocab_size = args.codebook_size

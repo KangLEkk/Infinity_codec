@@ -11,7 +11,7 @@ from math import log2, ceil
 from functools import partial, cache
 from collections import namedtuple
 from contextlib import nullcontext
-
+import math
 import torch.distributed as dist
 from torch.distributed import nn as dist_nn
 
@@ -26,7 +26,7 @@ from einops import rearrange, reduce, pack, unpack
 
 # from einx import get_at
 
-from .dynamic_resolution import predefined_HW_Scales_dynamic
+from .dynamic_resolution import predefined_HW_Scales_dynamic, full_ratio2hws
 
 # constants
 
@@ -100,6 +100,46 @@ class CosineSimLinear(Module):
         w = F.normalize(self.weight, dim = 0)
         return (x @ w) * self.scale
 
+def _build_any_hw_schedule(H: int, W: int, prefer_len: int = 13):
+    """
+    Build a progressive (h,w) schedule for arbitrary latent H,W.
+    Idea: pick the closest aspect-ratio template from full_ratio2hws,
+    then scale that template so its last entry matches (H,W).
+    """
+    # 选一个最接近的宽高比模板
+    ratio = float(W) / float(H)
+    ratios = list(full_ratio2hws.keys())
+    # 用 log 距离更稳（对称）
+    base_ratio = min(ratios, key=lambda r: abs(math.log(ratio) - math.log(r)))
+
+    base = full_ratio2hws[base_ratio]
+    # 用 prefer_len 截断到 7/10/13（你也可以固定用 13）
+    if prefer_len is not None:
+        base = base[:prefer_len]
+
+    # 按最后一项缩放到目标 H,W
+    h_last, w_last = base[-1]
+    sh = H / float(h_last)
+    sw = W / float(w_last)
+
+    out = []
+    prev_h, prev_w = 0, 0
+    for (h, w) in base:
+        hh = max(1, int(round(h * sh)))
+        ww = max(1, int(round(w * sw)))
+
+        # 保证单调增长，避免 rounding 导致回退/重复
+        hh = max(hh, prev_h)
+        ww = max(ww, prev_w)
+
+        if len(out) == 0 or (hh, ww) != out[-1]:
+            out.append((hh, ww))
+        prev_h, prev_w = hh, ww
+
+    if out[-1] != (H, W):
+        out.append((H, W))
+
+    return out
 
 def get_latent2scale_schedule(T: int, H: int, W: int, mode="original"):
     assert mode in ["original", "dynamic", "dense", "same1", "same2", "same3"]
@@ -125,6 +165,12 @@ def get_latent2scale_schedule(T: int, H: int, W: int, mode="original"):
         predefined_HW_Scales[(64, 64)] = [(64, 64) for _ in range(num_quant)]
 
     predefined_T_Scales = [1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 17, 17, 17, 17]
+    # if (H, W) not in predefined_HW_Scales:
+    #     # ⭐ fallback：动态生成并缓存，避免 KeyError
+    #     # prefer_len 你可以按需要改为 7/10/13
+    #     # 对 Kodak 32x48 我建议 prefer_len=10 或 13 都可以
+    #     predefined_HW_Scales[(H, W)] = _build_any_hw_schedule(H, W, prefer_len=13)
+        
     patch_THW_shape_per_scale = predefined_HW_Scales[(H, W)]
     if len(predefined_T_Scales) < len(patch_THW_shape_per_scale):
         # print("warning: the length of predefined_T_Scales is less than the length of patch_THW_shape_per_scale!")
@@ -195,6 +241,11 @@ class MultiScaleBSQ(Module):
         drop_when_test=False,
         drop_lvl_idx=None,
         drop_lvl_num=0,
+        # --- ARPC extensions ---
+        gm_active_bits_per_scale=None,
+        srd_prob=0.0,
+        srd_start_scale=3,
+        srd_mode="level",
         **kwargs
     ):
         super().__init__()
@@ -221,6 +272,12 @@ class MultiScaleBSQ(Module):
         if self.drop_when_test:
             assert drop_lvl_idx is not None
             assert drop_lvl_num > 0
+
+        # --- ARPC extensions (Group-Masked BMSRQ + Scale Random Dropout) ---
+        self.gm_active_bits_per_scale = gm_active_bits_per_scale
+        self.srd_prob = float(srd_prob)
+        self.srd_start_scale = int(srd_start_scale)
+        self.srd_mode = str(srd_mode)
 
         self.lfq = BSQ(
             dim = codebook_dim,
@@ -324,26 +381,69 @@ class MultiScaleBSQ(Module):
                     residual_norm_per_scale.append((torch.abs(interpolate_residual) < 0.05 * self.lfq.codebook_scale).sum() / interpolate_residual.numel())
                 # residual_list.append(torch.norm(residual.detach(), dim=1).mean())
                 # interpolate_residual_list.append(torch.norm(interpolate_residual.detach(), dim=1).mean())
-                if self.training and self.use_stochastic_depth and random.random() < self.drop_rate:
+                # -----------------------------
+                # Quantize at this scale
+                # -----------------------------
+                bit_indices = None
+                indices = None
+                loss = torch.zeros((), device=interpolate_residual.device, dtype=torch.float32)
+
+                if self.drop_when_test and drop_lvl_start <= si < drop_lvl_end:
+                    # deterministic drop at test time (legacy option)
+                    continue
+
+                if self.training and self.use_stochastic_depth and self.drop_rate > 0 and random.random() < self.drop_rate:
+                    # stochastic depth for quantizers (legacy option)
                     if (si == 0 and self.keep_first_quant) or (si == scale_num - 1 and self.keep_last_quant):
-                        quantized, indices, _, loss = self.lfq(interpolate_residual)
-                        quantized = quantized * out_fact
-                        all_indices.append(indices)
-                        all_losses.append(loss)
+                        quantized, indices, bit_indices, loss = self.lfq(interpolate_residual)
                     else:
+                        # fully drop this quantizer layer
                         quantized = torch.zeros_like(interpolate_residual)
-                elif self.drop_when_test and drop_lvl_start <= si < drop_lvl_end:
-                    continue                     
+                        # create dummy indices / bits so downstream code stays valid
+                        indices = torch.zeros((B, pt, ph, pw), device=interpolate_residual.device, dtype=torch.long)
+                        bit_indices = torch.zeros((B, pt, ph, pw, interpolate_residual.shape[1]), device=interpolate_residual.device, dtype=torch.int32)
+                        loss = loss * 0
                 else:
-                    # residual_norm = torch.norm(interpolate_residual.detach(), dim=1) # (b, t, h, w)
-                    # print(si, residual_norm.min(), residual_norm.max(), residual_norm.mean())
+                    # normal quantization
                     quantized, indices, bit_indices, loss = self.lfq(interpolate_residual)
-                    if self.random_flip and si < self.max_flip_lvl:
-                        quantized = self.flip_quant(quantized)
-                    if self.random_flip_1lvl and si == self.flip_lvl_idx:
-                        quantized = self.flip_quant(quantized)
-                    quantized = quantized * out_fact
-                    all_indices.append(indices)
+
+                # -----------------------------
+                # ARPC extensions
+                #   1) GM-BMSRQ: keep only active bits for this scale (always-on)
+                #   2) SRD: randomly drop later scales during training (train-only)
+                # -----------------------------
+                if bit_indices is None:
+                    # safety (shouldn't happen), but keep shapes consistent
+                    bit_indices = torch.zeros((B, pt, ph, pw, quantized.shape[1]), device=interpolate_residual.device, dtype=torch.int32)
+
+                # 1) group-masked bits
+                if self.gm_active_bits_per_scale is not None:
+                    try:
+                        active = int(self.gm_active_bits_per_scale[si])
+                    except Exception:
+                        active = int(quantized.shape[1])
+                    active = max(1, min(active, int(quantized.shape[1])))
+                    if active < int(quantized.shape[1]):
+                        quantized[:, active:, ...] = 0.0
+                        bit_indices[..., active:] = 0
+
+                # 2) scale random dropout (drop entire scale)
+                if self.training and self.srd_prob > 0 and si >= self.srd_start_scale:
+                    if random.random() < float(self.srd_prob):
+                        quantized = torch.zeros_like(interpolate_residual)
+                        indices = torch.zeros((B, pt, ph, pw), device=interpolate_residual.device, dtype=torch.long)
+                        bit_indices = torch.zeros((B, pt, ph, pw, interpolate_residual.shape[1]), device=interpolate_residual.device, dtype=torch.int32)
+                        loss = loss * 0
+
+                # optional bit-flip augmentations (legacy)
+                if self.random_flip and si < self.max_flip_lvl:
+                    quantized = self.flip_quant(quantized)
+                if self.random_flip_1lvl and si == self.flip_lvl_idx:
+                    quantized = self.flip_quant(quantized)
+
+                # scale factor
+                quantized = quantized * out_fact
+                all_indices.append(indices)
                 # quantized_list.append(torch.norm(quantized.detach(), dim=1).mean())
                 if (pt, ph, pw) != (T, H, W):
                     quantized = F.interpolate(quantized, size=(T, H, W), mode=self.z_interplote_up).contiguous()
