@@ -127,7 +127,7 @@ def gen_one_img(
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     img = img_list[0]
     return img
-
+    
 def get_prompt_id(prompt):
     md5 = hashlib.md5()
     md5.update(prompt.encode('utf-8'))
