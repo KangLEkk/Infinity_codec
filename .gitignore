@@ -37,6 +37,7 @@ output
 *.tsv
 *.mp4
 output/*
+outputs/
 results/
 *.JPEG
 debug/
