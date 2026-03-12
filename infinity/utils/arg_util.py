@@ -18,6 +18,25 @@ import infinity.utils.dist as dist
 class Args(Tap):
     local_out_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output')  # directory for save checkpoints
     data_path: str = ''                 # dataset
+    # stage2 processed dataset backend
+
+    dataset_backend: str = 'streaming'  # streaming | proc | proc_memmap
+    proc_data_path: str = ''            # folder containing samples.jsonl / shards/*
+    proc_res_list: str = ''             # e.g. "256" or "256,320,384"
+    proc_memmap_cache_size: int = 1     # opened memmap shard cache size per worker
+
+    # tiny entropy student
+    enable_student_entropy: int = 0
+    student_hidden_dim: int = 256
+    student_depth: int = 4
+    student_dropout: float = 0.0
+    student_lr: float = 2e-4
+    student_wd: float = 1e-4
+    student_grad_clip: float = 1.0
+    student_start_step: int = 0      # e.g. 50000: only update VAR before global step 50k
+    student_start_scale: int = 1
+    student_kd_ratio: float = 1.0
+    student_gt_ratio: float = 1.0
     bed: str = ''                       # bed directory for copy checkpoints apart from local_out_path
     vae_ckpt: str = ''                  # VAE ckpt
     # --- ARPC optional knobs (GM-BMSRQ / SRD) ---
@@ -34,7 +53,7 @@ class Args(Tap):
     ds: str = 'oi'                      # only used in GPT training::load_viz_data & FID benchmark
     model: str = ''                     # for VAE training, 'b' or any other for GPT training
     short_cap_prob: float = 0.2         # prob for training with short captions
-    project_name: str = 'Infinity'      # name of wandb project
+    project_name: str = 'Infinity'      # name of swanlab project
     tf32: bool = True                   # whether to use TensorFloat32
     auto_resume: bool = True            # whether to automatically resume from the last checkpoint found in args.bed
     rush_resume: str = ''               # pretrained infinity checkpoint
