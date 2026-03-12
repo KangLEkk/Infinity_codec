@@ -1,0 +1,14 @@
+python eval.py   --patch_size 16   --base_ch 128 --encoder_ch_mult 1 2 4 4 4 --decoder_ch_mult 1 2 4 4 4   \
+    --codebook_dim 32 --codebook_size 4294967296   \
+    --vqgan_ckpt  /workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_sample_512/checkpoints/model_step_14999.ckpt  --tokenizer flux   \
+    --dataset_list proc_memmap   --proc_dir /datasets/pixelprose/div2k_test_embedding_mmap   \
+    --resolution 512   --eval_res 512   --batch_size 8   --num_workers 8   --save my_val_eval   \
+    --default_root_dir test_tok   --new_quant --schedule_mode "dynamic" --remove_residual_detach \
+    --disable_codebook_usage   --quantizer_type 'MultiScaleBSQ' --use_entropy_model --rate_lambda 1.0 --debug --predict_objective soft_nll\
+    --dino_weight 0.02 \
+    --dino_max_scale 6 \
+    --dino_every 1 \
+    --dino_model dinov2_vits14 \
+    --dino_feat_dim 768 \
+    --dino_input_size 224 \
+    --dino_amp

@@ -127,7 +127,7 @@ class vgg16(torch.nn.Module):
         # load locally
         assert pretrained == True
         vgg_model = models.vgg16()
-        vgg_model.load_state_dict(torch.load("checkpoints/vgg16-397923af.pth", weights_only=True))
+        vgg_model.load_state_dict(torch.load("/workspace/CKPT/Infinity/vgg16-397923af.pth", weights_only=True))
         vgg_pretrained_features = vgg_model.features
 
         self.slice1 = torch.nn.Sequential()

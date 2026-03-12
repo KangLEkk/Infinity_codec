@@ -98,6 +98,27 @@ class MainArgs:
         parser.add_argument('--kl_weight', type=float, default=0.)
         parser.add_argument('--lfq_weight', type=float, default=0.)
         parser.add_argument('--entropy_loss_weight', type=float, default=0.1)
+
+        # --- RD fine-tuning (entropy model + coarse-scale emphasis) ---
+        parser.add_argument('--use_entropy_model', action='store_true',
+                            help='Enable conditional masked-CNN entropy model for bitwise codes')
+        parser.add_argument('--rate_lambda', type=float, default=0.0,
+                            help='Weight of rate term (estimated bits) in RD objective')
+        parser.add_argument('--rate_scale_mode', type=str, default='uniform',
+                            choices=['uniform', 'linear', 'power', 'custom'],
+                            help='How to weight rate across scales (finer scales can be penalized more)')
+        parser.add_argument('--rate_scale_alpha', type=float, default=2.0,
+                            help='Exponent for power weighting: w_k = (k/K)^alpha')
+        parser.add_argument('--rate_scale_weights', type=float, nargs='*', default=None,
+                            help='Custom per-scale weights (length = #scales). Used when rate_scale_mode=custom')
+        
+        parser.add_argument('--entropy_cond', type=str, default='prev_sum',
+                            choices=['prev_sum', 'none'],
+                            help='Conditioning for entropy model; prev_sum uses cumulative previous scales')
+
+        parser.add_argument('--coarse_prefix_scales', type=int, nargs='*', default=None,
+                            help='Prefix scale indices (1-based) to enforce coarse-only reconstruction')
+
         parser.add_argument('--commitment_loss_weight', type=float, default=0.25)
         parser.add_argument('--diversity_gamma', type=float, default=1)
         parser.add_argument('--norm_type', type=str, default='group', choices=['batch', 'group', "no"])

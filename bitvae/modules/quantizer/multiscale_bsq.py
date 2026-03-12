@@ -255,6 +255,7 @@ class MultiScaleBSQ(Module):
         x,
         mask = None,
         return_all_codes = False,
+        return_scale_data: bool = False,
     ):
         if x.ndim == 4:
             x = x.unsqueeze(2)
@@ -291,6 +292,11 @@ class MultiScaleBSQ(Module):
         all_losses = []
         all_indices = []
         all_bit_indices = []
+
+        # optional extra outputs for RD / coarse-scale training
+        scale_schedule_used = []
+        quantized_full_list = []  # quantized residuals upsampled to full (T,H,W)
+        pre_quant_list = []       # per-scale pre-quant continuous values aligned with bit_indices
         
         # go through the layers
         out_fact = init_out_fact = 1.0
@@ -303,6 +309,10 @@ class MultiScaleBSQ(Module):
         disable_flip = True if random.random() < self.disable_flip_prob else False # disable random flip in this image
         with autocast('cuda', enabled = False):
             for si, (pt, ph, pw) in enumerate(scale_schedule):
+
+                # NOTE: for RD training we may need to expose per-scale data.
+                # For any processed scale, we append its (pt,ph,pw) into scale_schedule_used.
+
                 
                 out_fact = max(0.1, out_fact) if self.use_decay_factor else init_out_fact
                 if (pt, ph, pw) != (T, H, W):
@@ -312,22 +322,56 @@ class MultiScaleBSQ(Module):
                 # residual_list.append(torch.norm(residual.detach(), dim=1).mean())
                 # interpolate_residual_list.append(torch.norm(interpolate_residual.detach(), dim=1).mean())
                 if self.training and self.use_stochastic_depth and random.random() < self.drop_rate:
-                    if (si == 0 and self.keep_first_quant) or (si == scale_num - 1 and self.keep_last_quant):
-                        quantized, indices, bit_indices, loss = self.lfq(interpolate_residual)
+                    # stochastic depth on scales: optionally keep first/last quant, otherwise drop this scale
+                    force_keep = (si == 0 and self.keep_first_quant) or (si == scale_num - 1 and self.keep_last_quant)
+
+                    if force_keep:
+                        lfq_ret = self.lfq(interpolate_residual, return_pre_quant=return_scale_data)
+                        if return_scale_data:
+                            (quantized, indices, bit_indices, loss), pre_quant = lfq_ret
+                        else:
+                            quantized, indices, bit_indices, loss = lfq_ret
+                            pre_quant = None
+
                         if self.random_flip and si < self.max_flip_lvl and (not disable_flip):
                             quantized = self.flip_quant(quantized)
+                        if self.random_flip_1lvl and (self.flip_lvl_idx is not None) and si == self.flip_lvl_idx and (not disable_flip):
+                            quantized = self.flip_quant(quantized)
+
                         quantized = quantized * out_fact
-                        all_indices.append(indices)
-                        all_losses.append(loss)
-                        all_bit_indices.append(bit_indices)
                     else:
+                        # drop this scale (no bits transmitted)
+                        # keep tensor shapes consistent with BSQ outputs:
+                        #   quantized: (B, C, pt, ph, pw)
+                        #   bit_indices / pre_quant: (B, pt, ph, pw, C)
                         quantized = torch.zeros_like(interpolate_residual)
+                        indices = None
+                        bit_indices = torch.zeros((B, pt, ph, pw, C), device=quantized.device, dtype=torch.int32)
+                        loss = torch.zeros((), device=quantized.device, dtype=torch.float32)
+
+                        if return_scale_data:
+                            # make soft-bits ~ 0 to match hard bits=0 (avoid sigmoid(0)=0.5)
+                            pre_quant = torch.full((B, pt, ph, pw, C), -10.0, device=quantized.device, dtype=torch.float32)
+                        else:
+                            pre_quant = None
+
+                    all_indices.append(indices)
+                    all_losses.append(loss)
+                    all_bit_indices.append(bit_indices)
+                    if return_scale_data:
+                        pre_quant_list.append(pre_quant)
                 elif self.drop_when_test and drop_lvl_start <= si < drop_lvl_end:
-                    continue                     
+                    # explicitly skip this scale
+                    continue
                 else:
                     # residual_norm = torch.norm(interpolate_residual.detach(), dim=1) # (b, t, h, w)
                     # print(si, residual_norm.min(), residual_norm.max(), residual_norm.mean())
-                    quantized, indices, bit_indices, loss = self.lfq(interpolate_residual)
+                    lfq_ret = self.lfq(interpolate_residual, return_pre_quant=return_scale_data)
+                    if return_scale_data:
+                        (quantized, indices, bit_indices, loss), pre_quant = lfq_ret
+                    else:
+                        quantized, indices, bit_indices, loss = lfq_ret
+                        pre_quant = None
                     if self.random_flip and si < self.max_flip_lvl and (not disable_flip):
                         quantized = self.flip_quant(quantized)
                     if self.random_flip_1lvl and si == self.flip_lvl_idx and (not disable_flip):
@@ -336,10 +380,22 @@ class MultiScaleBSQ(Module):
                     all_indices.append(indices)
                     all_losses.append(loss)
                     all_bit_indices.append(bit_indices)
+                    if return_scale_data:
+                        pre_quant_list.append(pre_quant)
                 # quantized_list.append(torch.norm(quantized.detach(), dim=1).mean())
+
+                # record processed scale
+                scale_schedule_used.append((pt, ph, pw))
+
                 if (pt, ph, pw) != (T, H, W):
                     quantized = F.interpolate(quantized, size=(T, H, W), mode=self.z_interplote_up).contiguous()
-                
+
+                if return_scale_data:
+                    q_full = quantized
+                    if q_full.size(2) == 1:
+                        q_full = q_full.squeeze(2)
+                    quantized_full_list.append(q_full)
+
                 if self.remove_residual_detach:
                     residual = residual - quantized
                 else:
@@ -366,6 +422,10 @@ class MultiScaleBSQ(Module):
         all_losses = torch.stack(all_losses, dim = -1)
 
         ret = (quantized_out, all_indices, all_bit_indices, all_losses)
+
+        if return_scale_data:
+            ret = (*ret, scale_schedule_used, quantized_full_list, pre_quant_list)
+
 
         if not return_all_codes:
             return ret
@@ -595,6 +655,7 @@ class BSQ(Module):
         self,
         x,
         return_loss_breakdown = False,
+        return_pre_quant: bool = False,
         mask = None,
         entropy_weight=0.1
     ):
@@ -625,7 +686,10 @@ class BSQ(Module):
         
         x = l2norm(x)
 
-        # whether to force quantization step to be full precision or not
+        
+        # --- expose pre-quantization continuous values for soft / STE bit training ---
+        pre_quant = x if return_pre_quant else None
+# whether to force quantization step to be full precision or not
 
         force_f32 = self.force_quantization_f32
 
@@ -697,10 +761,16 @@ class BSQ(Module):
 
             bit_indices = unpack_one(bit_indices, ps, 'b * c d')
 
+            if return_pre_quant:
+                pre_quant = unpack_one(pre_quant, ps, 'b * c d')
+
         # whether to remove single codebook dim
 
         if not self.keep_num_codebooks_dim:
             bit_indices = rearrange(bit_indices, '... 1 d -> ... d')
+
+        if return_pre_quant and (not self.keep_num_codebooks_dim):
+            pre_quant = rearrange(pre_quant, '... 1 d -> ... d')
 
         # complete aux loss
 
@@ -708,6 +778,9 @@ class BSQ(Module):
         # returns
 
         ret = Return(x, indices, bit_indices, aux_loss)
+
+        if return_pre_quant:
+            return ret, pre_quant
 
         if not return_loss_breakdown:
             return ret

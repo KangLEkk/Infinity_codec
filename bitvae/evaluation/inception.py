@@ -14,7 +14,7 @@ except ImportError:
 # http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
 FID_WEIGHTS_URL = 'https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth'
 
-FID_WEIGHTS_PATH = "checkpoints/pt_inception-2015-12-05-6726825d.pth"
+FID_WEIGHTS_PATH = "/workspace/CKPT/Infinity/pt_inception-2015-12-05-6726825d.pth"
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """Numpy implementation of the Frechet Distance.

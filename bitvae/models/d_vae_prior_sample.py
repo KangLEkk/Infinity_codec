@@ -16,7 +16,7 @@ except Exception:
     functional_call = None
 
 from bitvae.modules.quantizer import MultiScaleBSQ
-from bitvae.modules.entropy import BitwiseMaskedCNN, BitwiseMaskedCNNConfig, bernoulli_nll_bits_from_logits
+from bitvae.modules.entropy import OneShotScaleCausalPrior, OneShotScaleCausalPriorConfig, BitwiseMaskedCNN, BitwiseMaskedCNNConfig, bernoulli_nll_bits_from_logits
 from bitvae.modules import Conv, adopt_weight, LPIPS, Normalize
 from bitvae.utils.misc import ptdtype
 
@@ -393,16 +393,16 @@ class AutoEncoder(nn.Module):
             raise NotImplementedError(f"{args.quantizer_type} not supported")
         self.commitment_loss_weight = args.commitment_loss_weight
 
-        # --- Optional entropy model for RD fine-tuning (bitwise rate estimation) ---
+        # --- Optional entropy model for RD fine-tuning (now replaced by joint next-scale prior) ---
         self.use_entropy_model = getattr(args, 'use_entropy_model', False)
         self.rate_lambda = float(getattr(args, 'rate_lambda', 0.0))
-        self.rate_scale_mode = getattr(args, 'rate_scale_mode', 'power')
+        self.rate_scale_mode = getattr(args, 'rate_scale_mode', 'uniform')
         self.rate_scale_alpha = float(getattr(args, 'rate_scale_alpha', 2.0))
         self.rate_scale_weights = getattr(args, 'rate_scale_weights', None)
         self.entropy_cond = getattr(args, 'entropy_cond', 'prev_sum')
 
-        # --- Token-shaping via detached entropy model (A) ---
-        self.entropy_fit_lambda = float(getattr(args, 'entropy_fit_lambda', 1.0))
+        # --- Joint next-scale prior shaping ---
+        self.entropy_fit_lambda = float(getattr(args, 'entropy_fit_lambda', 1.0))  # kept only for compatibility
         self.predict_lambda = float(getattr(args, 'predict_lambda', 1.0))
         self.predict_max_scale = int(getattr(args, 'predict_max_scale', 6))  # <=0 means all
         self.predict_every = int(getattr(args, 'predict_every', 1))
@@ -410,34 +410,36 @@ class AutoEncoder(nn.Module):
         self.bit_tau = float(getattr(args, 'bit_tau', 1.0))
         self.bit_tau_min = float(getattr(args, 'bit_tau_min', 0.3))
         self.bit_tau_decay = float(getattr(args, 'bit_tau_decay', 20000.0))
-        self.entropy_input_mode = getattr(args, 'entropy_input_mode', 'st')  # hard|st|soft
-        self.soft_target_mode = getattr(args, 'soft_target_mode', 'soft')   # soft|st
+        self.entropy_input_mode = getattr(args, 'entropy_input_mode', 'st')  # kept for compatibility
+        self.soft_target_mode = getattr(args, 'soft_target_mode', 'soft')    # soft|st
         self.predict_objective = getattr(args, 'predict_objective', 'soft_nll')
         self.mi_alpha = float(getattr(args, 'mi_alpha', 0.0))
         self.tc_weight = float(getattr(args, 'tc_weight', 0.0))
         self.tc_mode = getattr(args, 'tc_mode', 'ysoft')
 
-        if self.use_entropy_model and (
-            self.rate_lambda > 0
-            or self.entropy_fit_lambda > 0
-            or self.predict_lambda > 0
-        ):
-            cfg = BitwiseMaskedCNNConfig(
+        if self.use_entropy_model and self.rate_lambda > 0:
+            cfg = OneShotScaleCausalPriorConfig(
                 bits_channels=args.codebook_dim,
-                cond_channels=args.codebook_dim,
-                hidden_channels=args.entropy_hidden,
-                num_res_blocks=args.entropy_resblocks,
-                kernel_size=args.entropy_kernel,
-                use_scale_embedding=True,
+                cond_channels=args.codebook_dim,   # 始终吃 D 通道 cond，非 prev_sum 时传零图
+                model_dim=getattr(args, 'entropy_hidden', 256),
+                depth=getattr(args, 'entropy_resblocks', 4),
+                num_heads=getattr(args, 'entropy_heads', 8),
+                mlp_ratio=getattr(args, 'entropy_mlp_ratio', 4.0),
+                dropout=getattr(args, 'entropy_dropout', 0.0),
                 max_scales=32,
-                scale_emb_dim=16,
-                fusion_mode=getattr(args, "entropy_fusion_mode", "gated_concat"),
-                cond_norm=getattr(args, "entropy_cond_norm", True),
-                cond_gate_init=getattr(args, "entropy_gate_init", 0.0),
+                use_scale_embedding=True,
+                use_pos2d=bool(getattr(args, 'entropy_use_pos2d', True)),
+                checkpoint_blocks=bool(getattr(args, 'entropy_checkpoint_blocks', False)),
+                cond_norm=True,
             )
-            self.entropy_model = BitwiseMaskedCNN(cfg)
+            self.entropy_model = OneShotScaleCausalPrior(cfg)
         else:
             self.entropy_model = None
+
+        # --- Optional entropy regularization to suppress late-scale uncertainty ---
+        self.prior_entropy_weight = float(getattr(args, 'prior_entropy_weight', 0.0))
+        self.prior_entropy_start_scale = int(getattr(args, 'prior_entropy_start_scale', 7))
+        self.prior_stopgrad_cond = bool(getattr(args, 'prior_stopgrad_cond', False))
 
         # --- Coarse-prefix reconstruction to push information into early scales ---
         self.coarse_prefix_scales = getattr(args, 'coarse_prefix_scales', None)
@@ -454,14 +456,14 @@ class AutoEncoder(nn.Module):
         self.dino_model_name = getattr(args, 'dino_model', 'dinov2_vits14')
         self.dino_input_size = int(getattr(args, 'dino_input_size', 224))
         self.dino_input_is_01 = bool(getattr(args, 'dino_input_is_01', False))
-        self.dino_feat_dim = int(getattr(args, 'dino_feat_dim', 384))  # dinov2_vits14=384
+        self.dino_feat_dim = int(getattr(args, 'dino_feat_dim', 384))
         self.dino_proj_hidden = int(getattr(args, 'dino_proj_hidden', 256))
         self.dino_proj_mlp_hidden = int(getattr(args, 'dino_proj_mlp_hidden', 512))
         self.dino_norm_type = getattr(args, 'dino_norm_type', 'group')
         self.dino_amp = bool(getattr(args, 'dino_amp', False))
         self.dino_teacher_on_cpu = bool(getattr(args, 'dino_teacher_on_cpu', False))
 
-        self._dino_teacher = None  # lazy init unless using cached features
+        self._dino_teacher = None
         if self.dino_weight > 0:
             self.dino_projector = LatentDinoProjector(
                 in_channels=args.codebook_dim,
@@ -497,10 +499,13 @@ class AutoEncoder(nn.Module):
         return _to_bt_dhw(y_soft), _to_bt_dhw(y_st), _to_bt_dhw(y_hard)
 
     @staticmethod
-    def _bernoulli_soft_nll_bits_from_logits(logits: torch.Tensor, target_prob: torch.Tensor, reduce: str = 'sum') -> torch.Tensor:
+    def _bernoulli_soft_nll_bits_from_logits(
+        logits: torch.Tensor,
+        target_prob: torch.Tensor,
+        reduce: str = 'sum'
+    ) -> torch.Tensor:
         nll_nats = F.binary_cross_entropy_with_logits(logits, target_prob, reduction=reduce)
         return nll_nats / math.log(2.0)
-
 
     @staticmethod
     def _bernoulli_hard_forward_soft_grad_nll_bits_from_logits(
@@ -509,19 +514,19 @@ class AutoEncoder(nn.Module):
         y_soft: torch.Tensor,
         reduce: str = 'sum'
     ) -> torch.Tensor:
-        """Forward equals hard-bit NLL (strict), but gradients follow soft target (y_soft)."""
+        """Forward equals hard-bit NLL, but gradients follow soft target."""
         loss_soft = AutoEncoder._bernoulli_soft_nll_bits_from_logits(logits, y_soft, reduce=reduce)
         loss_hard = bernoulli_nll_bits_from_logits(logits, y_hard.detach(), reduce=reduce)
         return loss_soft + (loss_hard - loss_soft).detach()
 
     @staticmethod
     def _bernoulli_marginal_entropy_bits(y_prob: torch.Tensor, reduce: str = 'sum') -> torch.Tensor:
-        """Approx marginal entropy H(Y) under independent Bernoulli per bit-dim using batch statistics."""
+        """Approx marginal entropy H(Y) under independent Bernoulli per bit-dim."""
         eps = 1e-6
         q = y_prob.mean(dim=(0, 2, 3)).clamp(min=eps, max=1.0 - eps)  # (D,)
-        h = -(q * torch.log(q) + (1.0 - q) * torch.log(1.0 - q)) / math.log(2.0)  # bits, (D,)
+        h = -(q * torch.log(q) + (1.0 - q) * torch.log(1.0 - q)) / math.log(2.0)
         if reduce == 'sum':
-            n = float(y_prob.shape[0] * y_prob.shape[2] * y_prob.shape[3])  # BT*H*W
+            n = float(y_prob.shape[0] * y_prob.shape[2] * y_prob.shape[3])
             return h.sum() * n
         elif reduce == 'mean':
             return h.mean()
@@ -530,14 +535,14 @@ class AutoEncoder(nn.Module):
 
     @staticmethod
     def _total_correlation_proxy(feat: torch.Tensor) -> torch.Tensor:
-        """Cheap redundancy proxy via off-diagonal correlation penalty (Barlow-Twins style)."""
+        """Cheap redundancy proxy via off-diagonal correlation penalty."""
         eps = 1e-6
         BT, D, H, W = feat.shape
-        z = feat.permute(0, 2, 3, 1).contiguous().view(BT * H * W, D)  # (N, D)
+        z = feat.permute(0, 2, 3, 1).contiguous().view(BT * H * W, D)
         z = z - z.mean(dim=0, keepdim=True)
         z = z / (z.std(dim=0, keepdim=True) + eps)
         n = z.shape[0]
-        corr = (z.t() @ z) / float(n)  # (D, D)
+        corr = (z.t() @ z) / float(n)
         eye = torch.eye(D, device=feat.device, dtype=feat.dtype)
         off = corr - eye
         return (off * off).sum() / float(D * D)
@@ -735,9 +740,7 @@ class AutoEncoder(nn.Module):
                 loss_dict["train/dino_loss"] = dino_loss * self.dino_weight
 
         
-        # --- RD: entropy model fitting + token-shaping (A) with soft / STE bits ---
-        # (1) entropy_fit_loss updates entropy_model only (tokenizer inputs detached)
-        # (2) rate_loss shapes tokenizer using functional_call with detached entropy_model params
+        # --- RD: one-shot all-scale next-scale prior (single forward) ---
         if self.entropy_model is not None and scale_schedule is not None:
             K = len(all_bit_indices)
 
@@ -754,130 +757,142 @@ class AutoEncoder(nn.Module):
                 w = [1.0 for _ in range(K)]
 
             img_pixels = float(x.shape[-2] * x.shape[-1])
-
-            if functional_call is None:
-                raise RuntimeError("torch.func.functional_call is required for token-shaping when training entropy_model and tokenizer jointly.")
-
-            detached_state = {n: p.detach() for n, p in self.entropy_model.named_parameters()}
-            detached_state.update({n: b.detach() for n, b in self.entropy_model.named_buffers()})
-
-            prev_full = None
-            fit_bits_total_w = torch.zeros((), device=x.device, dtype=torch.float32)
-            pred_bits_total_w = torch.zeros((), device=x.device, dtype=torch.float32)
-
+            prior_bits_total_w = torch.zeros((), device=x.device, dtype=torch.float32)
             do_predict = (self.predict_lambda > 0) and ((global_step % max(1, self.predict_every)) == 0)
 
+            cond_maps = []
+            scale_ids = []
+            y_soft_list = []
+            y_st_list = []
+            y_hard_list = []
+            pre_q_bt_list = []
+            batch_list = []
+            use_scale_list = []
+
+            prev_full = None
+
+            # -------- step 1: prepare cond maps / targets for all scales --------
             for si, bits_si in enumerate(all_bit_indices):
                 if bits_si is None:
                     continue
+
                 B0, Ts, Hs, Ws, D = bits_si.shape
                 assert D == self.args.codebook_dim
 
+                # cond for current scale = previous cumulative latent only
                 if self.entropy_cond == 'prev_sum':
                     if prev_full is None:
                         cond_pred = torch.zeros((B0, D, Hs, Ws), device=x.device, dtype=torch.float32)
-                        cond_fit = cond_pred
                     else:
                         cond_pred = F.interpolate(prev_full, size=(Hs, Ws), mode='area')
-                        cond_fit = cond_pred.detach()
                 else:
-                    cond_pred, cond_fit = None, None
+                    cond_pred = torch.zeros((B0, D, Hs, Ws), device=x.device, dtype=torch.float32)
 
-                if self.use_soft_bits and (pre_quant_list is not None) and (si < len(pre_quant_list)) and (pre_quant_list[si] is not None):
-                    pre_q = pre_quant_list[si]  # (B, T, H, W, D)
-                    tau = max(self.bit_tau_min, self.bit_tau * math.exp(-float(global_step) / max(1.0, self.bit_tau_decay)))
-                    y_soft = torch.sigmoid(pre_q / tau)
-                    y_hard = (bits_si > 0.5).to(dtype=torch.float32)
-                    y_st = y_hard + (y_soft - y_soft.detach())
-                else:
-                    pre_q = None
-                    y_hard = (bits_si > 0.5).to(dtype=torch.float32)
-                    y_soft = y_hard
-                    y_st = y_hard
+                if self.prior_stopgrad_cond:
+                    cond_pred = cond_pred.detach()
 
-                y_hard = y_hard.permute(0, 1, 4, 2, 3).contiguous().view(B0 * Ts, D, Hs, Ws)
-                y_soft = y_soft.permute(0, 1, 4, 2, 3).contiguous().view(B0 * Ts, D, Hs, Ws)
-                y_st   = y_st.permute(0, 1, 4, 2, 3).contiguous().view(B0 * Ts, D, Hs, Ws)
+                # expand to BT
+                cond_bt = cond_pred[:, None].expand(-1, Ts, -1, -1, -1).contiguous().view(B0 * Ts, D, Hs, Ws)
 
-                if self.entropy_input_mode == 'hard':
-                    y_in = y_hard
-                elif self.entropy_input_mode == 'soft':
-                    y_in = y_soft
-                else:
-                    y_in = y_st
+                bits_hard = bits_si.to(dtype=torch.float32)
 
-                if cond_pred is not None:
-                    cond_pred_bt = cond_pred[:, None].expand(-1, Ts, -1, -1, -1).contiguous().view(B0 * Ts, D, Hs, Ws)
-                    cond_fit_bt  = cond_fit[:, None].expand(-1, Ts, -1, -1, -1).contiguous().view(B0 * Ts, D, Hs, Ws)
-                else:
-                    cond_pred_bt, cond_fit_bt = None, None
-
-                scale_idx_t = torch.tensor(si, device=x.device)
-                do_predict_si = do_predict and (
-                    self.predict_max_scale <= 0 or (si + 1) <= self.predict_max_scale
-                )
-
-                logits_fit = self.entropy_model(
-                    y_in.detach(),
-                    cond=cond_fit_bt.detach() if cond_fit_bt is not None else None,
-                    scale_idx=scale_idx_t
-                )
-                fit_bits = bernoulli_nll_bits_from_logits(logits_fit, y_hard.detach(), reduce='sum') / float(B0)
-                fit_bits_total_w += (w[si] * fit_bits)
-                loss_dict[f'metric/rate_fit_bits_s{si+1}'] = fit_bits.detach()
-
-                if do_predict_si:
-                    logits_pred = functional_call(
-                        self.entropy_model,
-                        detached_state,
-                        (y_in,),
-                        {'cond': cond_pred_bt, 'scale_idx': scale_idx_t}
-                    )
-
-                    if self.predict_objective == 'soft_nll':
-                        target = y_st if self.soft_target_mode == 'st' else y_soft
-                        pred_bits = self._bernoulli_soft_nll_bits_from_logits(logits_pred, target, reduce='sum') / float(B0)
-
-                    elif self.predict_objective == 'strict_entropy':
-                        pred_bits = self._bernoulli_hard_forward_soft_grad_nll_bits_from_logits(
-                            logits_pred, y_hard, y_soft, reduce='sum'
-                        ) / float(B0)
-
-                    elif self.predict_objective == 'mi':
-                        h_cond = self._bernoulli_hard_forward_soft_grad_nll_bits_from_logits(
-                            logits_pred, y_hard, y_soft, reduce='sum'
+                if self.use_soft_bits:
+                    if pre_quant_list is None or si >= len(pre_quant_list) or pre_quant_list[si] is None:
+                        raise RuntimeError(
+                            "pre_quant_list is required for soft/STE bit training. "
+                            "Patch MultiScaleBSQ/BSQ to return pre-quant values."
                         )
-                        h_marg = self._bernoulli_marginal_entropy_bits(y_soft, reduce='sum')
-                        pred_bits = (h_cond - self.mi_alpha * h_marg) / float(B0)
+                    pre_q = pre_quant_list[si].to(dtype=torch.float32)
+                    y_soft, y_st, y_hard = self._make_soft_bits(bits_hard, pre_q, global_step)
+                    pre_q_bt = pre_q.permute(0, 1, 4, 2, 3).contiguous().view(B0 * Ts, D, Hs, Ws)
+                else:
+                    y_hard = bits_hard.permute(0, 1, 4, 2, 3).contiguous().view(B0 * Ts, D, Hs, Ws)
+                    y_soft, y_st = y_hard, y_hard
+                    pre_q_bt = None
 
-                    else:
-                        target = y_st if self.soft_target_mode == 'st' else y_soft
-                        pred_bits = self._bernoulli_soft_nll_bits_from_logits(logits_pred, target, reduce='sum') / float(B0)
+                cond_maps.append(cond_bt)
+                scale_ids.append(si)
+                y_soft_list.append(y_soft)
+                y_st_list.append(y_st)
+                y_hard_list.append(y_hard)
+                pre_q_bt_list.append(pre_q_bt)
+                batch_list.append(B0)
 
-                    if self.tc_weight > 0:
-                        if self.tc_mode == 'preq' and self.use_soft_bits and pre_q is not None:
-                            pre_q_bt = pre_q.permute(0, 1, 4, 2, 3).contiguous().view(B0 * Ts, D, Hs, Ws)
-                            feat_tc = pre_q_bt
-                        else:
-                            feat_tc = y_soft
-                        tc = self._total_correlation_proxy(feat_tc)
-                        pred_bits = pred_bits + (self.tc_weight * tc)
+                # 这里控制“哪些尺度参与 loss”
+                # 但 forward 仍然是一次性把所有尺度都预测出来
+                use_this_scale = do_predict and (self.predict_max_scale <= 0 or (si + 1) <= self.predict_max_scale)
+                use_scale_list.append(use_this_scale)
 
-                    pred_bits_total_w += (w[si] * pred_bits)
-                    loss_dict[f'metric/rate_pred_bits_s{si+1}'] = pred_bits.detach()
-
+                # roll prefix for next scale
                 if quantized_full_list is not None and si < len(quantized_full_list):
                     q_full = quantized_full_list[si]
                     prev_full = q_full if prev_full is None else (prev_full + q_full)
 
-            bpp_fit_w = (fit_bits_total_w / img_pixels)
-            loss_dict['metric/bpp_fit_weighted'] = bpp_fit_w.detach()
-            loss_dict['train/entropy_fit_loss'] = bpp_fit_w * self.entropy_fit_lambda
+            # -------- step 2: one-shot prior forward over all scales --------
+            if len(cond_maps) > 0:
+                logits_pred_list = self.entropy_model(cond_maps=cond_maps, scale_ids=scale_ids)
+            else:
+                logits_pred_list = []
 
-            if do_predict and torch.is_tensor(pred_bits_total_w) and pred_bits_total_w.abs().item() > 0:
-                bpp_pred_w = (pred_bits_total_w / img_pixels)
-                loss_dict['metric/bpp_pred_weighted'] = bpp_pred_w.detach()
-                loss_dict['train/rate_loss'] = bpp_pred_w * self.rate_lambda * float(self.predict_lambda)
+            # -------- step 3: compute per-scale losses --------
+            for li, si in enumerate(scale_ids):
+                logits_pred = logits_pred_list[li]
+                y_soft = y_soft_list[li]
+                y_st = y_st_list[li]
+                y_hard = y_hard_list[li]
+                B0 = batch_list[li]
+                pre_q_bt = pre_q_bt_list[li]
+
+                if self.predict_objective == 'soft_nll':
+                    target = y_st if self.soft_target_mode == 'st' else y_soft
+                    pred_bits = self._bernoulli_soft_nll_bits_from_logits(
+                        logits_pred, target, reduce='sum'
+                    ) / float(B0)
+
+                elif self.predict_objective == 'strict_entropy':
+                    pred_bits = self._bernoulli_hard_forward_soft_grad_nll_bits_from_logits(
+                        logits_pred, y_hard, y_soft, reduce='sum'
+                    ) / float(B0)
+
+                elif self.predict_objective == 'mi':
+                    h_cond = self._bernoulli_hard_forward_soft_grad_nll_bits_from_logits(
+                        logits_pred, y_hard, y_soft, reduce='sum'
+                    )
+                    h_marg = self._bernoulli_marginal_entropy_bits(y_soft, reduce='sum')
+                    pred_bits = (h_cond - self.mi_alpha * h_marg) / float(B0)
+
+                else:
+                    target = y_st if self.soft_target_mode == 'st' else y_soft
+                    pred_bits = self._bernoulli_soft_nll_bits_from_logits(
+                        logits_pred, target, reduce='sum'
+                    ) / float(B0)
+
+                if self.tc_weight > 0:
+                    if self.tc_mode == 'preq' and self.use_soft_bits and (pre_q_bt is not None):
+                        feat_tc = pre_q_bt
+                    else:
+                        feat_tc = y_soft
+                    tc = self._total_correlation_proxy(feat_tc)
+                    pred_bits = pred_bits + (self.tc_weight * tc)
+                    loss_dict[f'metric/prior_tc_s{si+1}'] = tc.detach()
+
+                if self.prior_entropy_weight > 0 and (si + 1) >= max(1, self.prior_entropy_start_scale):
+                    h_marg = self._bernoulli_marginal_entropy_bits(y_soft, reduce='sum') / float(B0)
+                    pred_bits = pred_bits + (self.prior_entropy_weight * h_marg)
+                    loss_dict[f'metric/prior_marginal_entropy_s{si+1}'] = h_marg.detach()
+
+                loss_dict[f'metric/rate_pred_bits_s{si+1}'] = pred_bits.detach()
+
+                if use_scale_list[li]:
+                    prior_bits_total_w = prior_bits_total_w + (w[si] * pred_bits)
+
+            loss_dict['train/entropy_fit_loss'] = torch.zeros((), device=x.device, dtype=torch.float32)
+
+            if do_predict:
+                bpp_prior_w = (prior_bits_total_w / img_pixels)
+                loss_dict['metric/bpp_pred_weighted'] = bpp_prior_w.detach()
+                loss_dict['metric/bpp_fit_weighted'] = bpp_prior_w.detach()
+                loss_dict['train/rate_loss'] = bpp_prior_w * self.rate_lambda * float(self.predict_lambda)
             else:
                 loss_dict['train/rate_loss'] = torch.zeros((), device=x.device, dtype=torch.float32)
 
@@ -995,24 +1010,68 @@ class AutoEncoder(nn.Module):
         parser.add_argument("--encoder_ch_mult", type=int, nargs='+', default=[1, 1, 2, 2, 4])
         parser.add_argument("--decoder_ch_mult", type=int, nargs='+', default=[1, 1, 2, 2, 4])
         # RD / entropy shaping (A)
+        # RD / next-scale prior shaping
         parser.add_argument("--entropy_fit_lambda", type=float, default=1.0)
         parser.add_argument("--predict_lambda", type=float, default=1.0)
-        parser.add_argument("--predict_max_scale", type=int, default=0)
+        parser.add_argument("--predict_max_scale", type=int, default=6)
         parser.add_argument("--predict_every", type=int, default=1)
         parser.add_argument("--use_soft_bits", action="store_true")
         parser.add_argument("--bit_tau", type=float, default=1.0)
         parser.add_argument("--bit_tau_min", type=float, default=0.3)
         parser.add_argument("--bit_tau_decay", type=float, default=20000.0)
-        parser.add_argument("--entropy_input_mode", type=str, default="st", choices=["hard","st","soft"])
-        parser.add_argument("--soft_target_mode", type=str, default="soft", choices=["soft","st"])
+        parser.add_argument("--entropy_input_mode", type=str, default="st", choices=["hard", "st", "soft"])
+        parser.add_argument("--soft_target_mode", type=str, default="soft", choices=["soft", "st"])
+        parser.add_argument("--entropy_hidden", type=int, default=256)
+        parser.add_argument("--entropy_resblocks", type=int, default=4)   # 这里现在表示 prior depth
+        parser.add_argument("--entropy_heads", type=int, default=8)
+        parser.add_argument("--entropy_mlp_ratio", type=float, default=4.0)
+        parser.add_argument("--entropy_dropout", type=float, default=0.0)
+        parser.add_argument("--entropy_use_pos2d", action="store_true")
+        parser.add_argument("--entropy_checkpoint_blocks", action="store_true")
+        parser.add_argument(
+            "--predict_objective",
+            type=str,
+            default="soft_nll",
+            choices=["soft_nll", "strict_entropy", "mi"],
+            help="soft_nll: CE(logits, y_soft/y_st). strict_entropy: forward uses hard bits but gradient uses y_soft. mi: H_cond - mi_alpha*H_marg."
+        )
+        parser.add_argument(
+            "--mi_alpha",
+            type=float,
+            default=0.0,
+            help="Weight for marginal-entropy term when predict_objective=mi."
+        )
+        parser.add_argument(
+            "--tc_weight",
+            type=float,
+            default=0.0,
+            help="Weight for total-correlation / redundancy penalty."
+        )
+        parser.add_argument(
+            "--tc_mode",
+            type=str,
+            default="ysoft",
+            choices=["ysoft", "preq"],
+            help="Feature used for TC penalty: ysoft or preq."
+        )
 
-        parser.add_argument("--predict_objective", type=str, default="soft_nll",
-                            choices=["soft_nll", "strict_entropy", "mi"],
-                            help="A objective for token shaping. soft_nll: CE(logits, y_soft/y_st). strict_entropy: forward uses hard bits but gradient uses y_soft. mi: H_cond - mi_alpha*H_marg.")
-        parser.add_argument("--mi_alpha", type=float, default=0.0, help="Weight for marginal-entropy term when predict_objective=mi (maximize H_marg).")
-        parser.add_argument("--tc_weight", type=float, default=0.0, help="Weight for total-correlation / redundancy penalty on early-scale tokens (BarlowTwins-style off-diag corr).")
-        parser.add_argument("--tc_mode", type=str, default="ysoft", choices=["ysoft", "preq"],
-                            help="Feature used for TC penalty: ysoft (sigmoid pre-quant) or preq (pre-quant continuous).")
+        parser.add_argument(
+            "--prior_entropy_weight",
+            type=float,
+            default=0.0,
+            help="Later-scale weighted marginal entropy penalty on current-scale soft bits."
+        )
+        parser.add_argument(
+            "--prior_entropy_start_scale",
+            type=int,
+            default=7,
+            help="Apply prior_entropy_weight from this 1-based scale onward."
+        )
+        parser.add_argument(
+            "--prior_stopgrad_cond",
+            action="store_true",
+            help="Stop gradient from next-scale prior into prefix condition F_{k-1}."
+        )
 
         # DINO distillation (latent->projector, align to DINO(x) or cached embedding)
         parser.add_argument("--dino_weight", type=float, default=0.0)
@@ -1030,9 +1089,9 @@ class AutoEncoder(nn.Module):
         parser.add_argument("--dino_amp", action="store_true", help="Use autocast fp16 for teacher forward on CUDA.")
         parser.add_argument("--dino_teacher_on_cpu", action="store_true", help="Run DINO teacher on CPU (slower but avoids GPU memory).")
 
-        parser.add_argument("--entropy_fusion_mode", type=str, default="gated_concat",
-                    choices=["add", "concat", "gated_concat", "film"])
-        parser.add_argument("--entropy_cond_norm", action="store_true")
-        parser.add_argument("--entropy_gate_init", type=float, default=0.0)
+        # parser.add_argument("--entropy_fusion_mode", type=str, default="gated_concat",
+        #             choices=["add", "concat", "gated_concat", "film"])
+        # parser.add_argument("--entropy_cond_norm", action="store_true")
+        # parser.add_argument("--entropy_gate_init", type=float, default=0.0)
         
         return parser
