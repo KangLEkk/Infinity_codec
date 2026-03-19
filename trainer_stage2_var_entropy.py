@@ -239,7 +239,7 @@ class InfinityTrainer(object):
 
             if self.reweight_loss_by_scale:
                 lw = []
-                last_scale_area = np.sqrt(scale_schedule[-1].prod())
+                last_scale_area = np.sqrt(int(np.prod(scale_schedule[-1])))
                 for (pt, ph, pw) in scale_schedule[:training_scales]:
                     this_scale_area = np.sqrt(pt * ph * pw)
                     lw.extend([last_scale_area / this_scale_area for _ in range(pt * ph * pw)])

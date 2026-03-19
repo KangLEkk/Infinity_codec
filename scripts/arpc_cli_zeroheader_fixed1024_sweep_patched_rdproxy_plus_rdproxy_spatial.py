@@ -22,8 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import os.path as osp
-import shutil
 from typing import Dict
 
 import numpy as np
@@ -31,12 +29,9 @@ import torch
 from PIL import Image
 
 # from codec.arpc_codec_none_zeroheader_fixed1024 import ARPCNoneZeroHeaderFixed1024
-from codec.arpc_codec_zeroheader_fixed1024_entropy_masks_varfill import ARPCNoneZeroHeaderFixed1024
+from codec.arpc_codec_zeroheader_fixed1024_entropy_masks_varfill_patched_rdproxy_clean_plus_rdproxy_spatial_v3 import ARPCNoneZeroHeaderFixed1024
 from infinity.models.bsq_vae.vae import vae_model
-# try:
-#     from infinity.models.infinity import Infinity as InfinityModel
-# except Exception:
-from infinity.models.infinity_patched import Infinity as InfinityModel
+from infinity.models.infinity_patched import Infinity as InfinityPatched
 
 
 # -----------------------------
@@ -133,143 +128,56 @@ def load_vae(vae_ckpt: str, vae_type: int, apply_spatial_patchify: int, device: 
     return vae
 
 
-def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_fsdp'):
-    print('[Save slim model]')
-    full_ckpt = torch.load(infinity_model_path, map_location='cpu', weights_only=False)
-    infinity_slim = full_ckpt['trainer'][key]
-    if not save_file:
-        save_file = osp.splitext(infinity_model_path)[0] + '-slim.pth'
-    print(f'Save to {save_file}')
-    torch.save(infinity_slim, save_file)
-    print('[Save slim model] done')
-    return save_file
-
-
 @torch.no_grad()
-def load_infinity(
-    rope2d_each_sa_layer,
-    rope2d_normalized_by_hw,
-    use_scale_schedule_embedding,
-    pn,
-    use_bit_label,
-    add_lvl_embeding_only_first_block,
-    model_path='',
-    scale_schedule=None,
-    vae=None,
-    device='cuda',
-    model_kwargs=None,
-    text_channels=2048,
-    apply_spatial_patchify=0,
-    use_flex_attn=False,
-    bf16=False,
-    checkpoint_type='torch',
-):
-    print('[Loading Infinity]')
-    text_maxlen = 512
-    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
-        gpt = InfinityModel(
-            vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-            shared_aln=True, raw_scale_schedule=scale_schedule,
-            checkpointing='full-block',
+def load_infinity(model_ckpt: str, vae, args, device: torch.device):
+    text_maxlen = int(args.tlen)
+    model_kwargs = _model_kwargs_from_type(args.model_type)
+
+    with torch.cuda.amp.autocast(enabled=bool(args.bf16), dtype=torch.bfloat16, cache_enabled=True):
+        gpt = InfinityPatched(
+            vae_local=vae,
+            text_channels=int(args.text_channels),
+            text_maxlen=text_maxlen,
+            shared_aln=True,
+            raw_scale_schedule=None,
+            checkpointing="full-block",
             customized_flash_attn=False,
             fused_norm=True,
             pad_to_multiplier=128,
-            use_flex_attn=use_flex_attn,
-            add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-            use_bit_label=use_bit_label,
-            rope2d_each_sa_layer=rope2d_each_sa_layer,
-            rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-            pn=pn,
-            apply_spatial_patchify=apply_spatial_patchify,
+            use_flex_attn=bool(args.use_flex_attn),
+            add_lvl_embeding_only_first_block=int(args.add_lvl_embeding_only_first_block),
+            use_bit_label=int(args.use_bit_label),
+            rope2d_each_sa_layer=int(args.rope2d_each_sa_layer),
+            rope2d_normalized_by_hw=int(args.rope2d_normalized_by_hw),
+            pn=str(getattr(args, "pn", "1M")),
+            apply_spatial_patchify=int(args.apply_spatial_patchify),
             inference_mode=True,
-            train_h_div_w_list=[1.0],
+            train_h_div_w_list=[float(getattr(args, "h_div_w_template", 1.0))],
             **model_kwargs,
-        ).to(device=device)
-        print(f'[you selected Infinity with model_kwargs={model_kwargs}] model size: {sum(p.numel() for p in gpt.parameters())/1e9:.2f}B, bf16={bf16}')
+        ).to(device)
 
-        if bf16:
-            for block in gpt.unregistered_blocks:
-                block.bfloat16()
+    gpt.eval().requires_grad_(False)
 
-        gpt.eval()
-        gpt.requires_grad_(False)
+    ckpt = torch.load(model_ckpt, map_location=device, weights_only=False)
+    state = ckpt
+    if isinstance(ckpt, dict):
+        for key in ["state_dict", "model", "gpt", "ema"]:
+            if key in ckpt and isinstance(ckpt[key], dict):
+                state = ckpt[key]
+                break
 
-        gpt.cuda()
-        torch.cuda.empty_cache()
-
-        print('[Load Infinity weights]')
-        if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device)
-            print(gpt.load_state_dict(state_dict))
-        elif checkpoint_type == 'torch_shard':
-            from transformers.modeling_utils import load_sharded_checkpoint
-            load_sharded_checkpoint(gpt, model_path, strict=False)
-        gpt.rng = torch.Generator(device=device)
-        return gpt
-
-
-def load_transformer(vae, args, device: torch.device):
-    model_path = args.model_ckpt
-    if args.checkpoint_type == 'torch':
-        # if osp.exists(args.cache_dir):
-        #     local_model_path = osp.join(args.cache_dir, 'tmp', model_path.replace('/', '_'))
-        # else:
-        #     local_model_path = model_path
-        local_model_path = model_path
-        if args.enable_model_cache:
-            slim_model_path = model_path.replace('ar-', 'slim-')
-            local_slim_model_path = local_model_path.replace('ar-', 'slim-')
-            os.makedirs(osp.dirname(local_slim_model_path), exist_ok=True)
-            print(f'model_path: {model_path}, slim_model_path: {slim_model_path}')
-            print(f'local_model_path: {local_model_path}, local_slim_model_path: {local_slim_model_path}')
-            if not osp.exists(local_slim_model_path):
-                if osp.exists(slim_model_path):
-                    print(f'copy {slim_model_path} to {local_slim_model_path}')
-                    shutil.copyfile(slim_model_path, local_slim_model_path)
-                else:
-                    if not osp.exists(local_model_path):
-                        print(f'copy {model_path} to {local_model_path}')
-                        shutil.copyfile(model_path, local_model_path)
-                    save_slim_model(local_model_path, save_file=local_slim_model_path, device=device)
-                    print(f'copy {local_slim_model_path} to {slim_model_path}')
-                    if not osp.exists(slim_model_path):
-                        shutil.copyfile(local_slim_model_path, slim_model_path)
-                        os.remove(local_model_path)
-                        os.remove(model_path)
-            slim_model_path = local_slim_model_path
-        else:
-            slim_model_path = model_path
-        print(f'load checkpoint from {slim_model_path}')
-    elif args.checkpoint_type == 'torch_shard':
-        slim_model_path = model_path
-    else:
-        raise ValueError(f'unknown checkpoint_type: {args.checkpoint_type}')
-
-    kwargs_model = _model_kwargs_from_type(args.model_type)
-    return load_infinity(
-        rope2d_each_sa_layer=args.rope2d_each_sa_layer,
-        rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
-        use_scale_schedule_embedding=getattr(args, 'use_scale_schedule_embedding', 0),
-        pn=args.pn,
-        use_bit_label=args.use_bit_label,
-        add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
-        model_path=slim_model_path,
-        scale_schedule=None,
-        vae=vae,
-        device=device,
-        model_kwargs=kwargs_model,
-        text_channels=args.text_channels,
-        apply_spatial_patchify=args.apply_spatial_patchify,
-        use_flex_attn=args.use_flex_attn,
-        bf16=args.bf16,
-        checkpoint_type=args.checkpoint_type,
-    )
+    missing, unexpected = gpt.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[WARN] missing keys: {len(missing)}")
+    if unexpected:
+        print(f"[WARN] unexpected keys: {len(unexpected)}")
+    return gpt
 
 
 def build_codec(args, device: torch.device) -> ARPCNoneZeroHeaderFixed1024:
     text_tokenizer, text_encoder = load_text_encoder(args.text_encoder_ckpt, device)
     vae = load_vae(args.vae_ckpt, args.vae_type, args.apply_spatial_patchify, device)
-    model = load_transformer(vae, args, device)
+    model = load_infinity(args.model_ckpt, vae, args, device)
 
     codec = ARPCNoneZeroHeaderFixed1024(
         vae=vae,
@@ -297,7 +205,7 @@ def build_codec(args, device: torch.device) -> ARPCNoneZeroHeaderFixed1024:
         except Exception:
             base = {}
         kr = str(getattr(args, "keep_ratio", "") or "").strip()
-        if kr and codec.mask_strategy in ("entropy_channel", "entropy_spatial"):
+        if kr and codec.mask_strategy in ("entropy_channel", "entropy_spatial", "entropy_spatial_global", "rdproxy_spatial_global"):
             try:
                 base["keep_ratio"] = float(kr)
             except Exception:
@@ -359,11 +267,11 @@ def main():
 
     # masking strategies (ZERO header; must match encoder/decoder)
     common.add_argument("--mask_strategy", type=str, default="none",
-                        help="Mask strategy: none | entropy_channel | entropy_scale | entropy_spatial (0-header; must match encoder/decoder).")
+                        help="Mask strategy: none | entropy_channel | entropy_scale | entropy_spatial | entropy_spatial_global | rdproxy_spatial | rdproxy_spatial_global (0-header; must match encoder/decoder).")
     common.add_argument("--mask_params", type=str, default="{}",
                         help="JSON dict of params for the mask strategy (0-header; must match encoder/decoder).")
     common.add_argument("--keep_ratio", type=str, default="",
-                        help="Convenience override: set keep_ratio in mask_params (e.g., 0.1). Only used by entropy_channel/spatial.")
+                        help="Convenience override: set keep_ratio in mask_params (e.g., 0.1). Only used by entropy_channel/entropy_spatial/entropy_spatial_global.")
     common.add_argument("--active_bits", type=str, default="all",
                         help="Active bits spec shared by encoder/decoder. e.g. 'all' or '16'.")
 
@@ -381,15 +289,11 @@ def main():
     common.add_argument("--use_bit_label", type=int, default=1, choices=[0, 1])
     common.add_argument("--use_flex_attn", type=int, default=0, choices=[0, 1])
     common.add_argument("--bf16", type=int, default=1, choices=[0, 1])
-    common.add_argument("--cache_dir", type=str, default="/dev/shm")
-    common.add_argument("--enable_model_cache", type=int, default=0, choices=[0, 1])
-    common.add_argument("--checkpoint_type", type=str, default="torch")
-    common.add_argument("--use_scale_schedule_embedding", type=int, default=0, choices=[0, 1])
 
-    # keep these for compatibility with run_infinity / Infinity init
+    # keep these for compatibility with your InfinityPatched init (ignored by fixed_hw in preprocessing)
     common.add_argument("--pn", type=str, default="1M")
     common.add_argument("--h_div_w_template", type=float, default=1.0)
-    common.add_argument("--add_lvl_embeding_only_first_block", type=int, default=1, choices=[0, 1])
+    common.add_argument("--add_lvl_embeding_only_first_block", type=int, default=0, choices=[0, 1])
     common.add_argument("--rope2d_each_sa_layer", type=int, default=1, choices=[0, 1])
     common.add_argument("--rope2d_normalized_by_hw", type=int, default=2, choices=[0, 1, 2])
 

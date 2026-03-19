@@ -102,6 +102,7 @@ class Infinity(nn.Module):
         always_training_scales=20,
         apply_spatial_patchify = 0,
         inference_mode=False,
+        **kwargs
     ):
         # set hyperparameters
         self.C = embed_dim

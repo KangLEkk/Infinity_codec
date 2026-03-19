@@ -16,7 +16,7 @@ fi
 
 PROC_DIR=${PROC_DIR:-"/datasets/pixelprose/embedding_mmap"}
 PROC_VAL_DIR=${PROC_VAL_DIR:-"/datasets/pixelprose/div2k_test_embedding_mmap"}
-OUTDIR=${OUTDIR:-"outputs/bitvae_tok_stage1_dino0.1_sample_512"}
+OUTDIR=${OUTDIR:-"outputs/bitvae_tok_stage1_dino0.1_2"}
 
 # --nnodes=$NODE_NUM \
 # export MASTER_PORT=$((29500 + RANDOM % 100)) 
@@ -24,18 +24,18 @@ OUTDIR=${OUTDIR:-"outputs/bitvae_tok_stage1_dino0.1_sample_512"}
 # --node_rank=$NODE_ID --master_port=$PORT \
 #  --multiscale_training
 # strict_entropy soft_nll
-CUDA_VISIBLE_DEVICES=2 torchrun \
+CUDA_VISIBLE_DEVICES=1 torchrun \
     --nproc_per_node=$WORKER_GPU  --master_port 29500\
     train_tokenizer.py --num_workers $NUM_WORKERS \
     --patch_size 16 \
     --base_ch 128 --encoder_ch_mult 1 2 4 4 4 --decoder_ch_mult 1 2 4 4 4 \
     --codebook_dim 32 \
-    --optim_type AdamW --lr 1e-4 --disable_sch --max_steps 60000 \
-    --resolution 512 512 --batch_size 4 --dataset_list proc_memmap --proc_dir ${PROC_DIR}  --proc_val_dir ${PROC_VAL_DIR} --dataaug "resizecrop" \
+    --optim_type AdamW --lr 1e-4 --disable_sch --max_steps 600000 \
+    --resolution 1024 1024 --batch_size 4 --dataset_list proc_memmap --proc_dir ${PROC_DIR}  --proc_val_dir ${PROC_VAL_DIR} --dataaug "resizecrop" --multiscale_training \
     --disc_layers 3 --discriminator_iter_start 0 \
     --l1_weight 1 --perceptual_weight 1 --image_disc_weight 1 --image_gan_weight 0.3 --gan_feat_weight 0 --lfq_weight 4 \
     --codebook_size 4294967296 --entropy_loss_weight 0.1 --diversity_gamma 1 \
-    --default_root_dir ${OUTDIR} --log_every 100 --ckpt_every 5000 --visu_every 1000 \
+    --default_root_dir ${OUTDIR} --log_every 100 --ckpt_every 10000 --visu_every 4000 \
     --new_quant --lr_drop 45000 \
     --remove_residual_detach --use_lecam_reg_zero --base_ch_disc 128 --dis_lr_multiplier 2.0 --use_checkpoint \
     --schedule_mode "dense" --use_stochastic_depth --drop_rate 0.5 --keep_last_quant --tokenizer 'flux' --quantizer_type 'MultiScaleBSQ' \
@@ -51,7 +51,7 @@ CUDA_VISIBLE_DEVICES=2 torchrun \
     --dino_input_size 224 \
     --dino_amp \
     --coarse_prefix_sample \
-    --coarse_prefix_scales 4 6 8 10 13 \
+    --coarse_prefix_scales 4 6 8 13 \
     --coarse_prefix_full_prob 0.5 \
     --dino_scales 4 6 8 10 13 \
     --dino_scale_decay 0.7

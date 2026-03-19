@@ -297,7 +297,8 @@ class Infinity(nn.Module):
             full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][self.pn]['scales']
             if self.inference_mode:
                 apply_flex_attn_scales = list(range(1, 1+len(full_scale_schedule)))
-                mask_type = "infinity_infer_mask_with_kv_cache"
+                # mask_type = "infinity_infer_mask_with_kv_cache"
+                mask_type = "var_infer_mask_with_kv_cache"
                 auto_padding = True
             else:
                 mask_type = 'var'

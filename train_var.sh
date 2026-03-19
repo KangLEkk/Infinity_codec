@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
 
 set -x
-
+export CUDA_VISIBLE_DEVICES=1,3
 # set dist args
-nproc_per_node=${ARNOLD_WORKER_GPU}
+nproc_per_node=2
 
-if [ ! -z "$SINGLE" ] && [ "$SINGLE" != "0" ]; then
-  echo "[single node alone] SINGLE=$SINGLE"
-  nnodes=1
-  node_rank=0
-  nproc_per_node=1
-  master_addr=127.0.0.1
-  master_port=12345
-else
-  MASTER_NODE_ID=0
-  nnodes=${ARNOLD_WORKER_NUM}
-  node_rank=${ARNOLD_ID}
-  master_addr="METIS_WORKER_${MASTER_NODE_ID}_HOST"
-  master_addr=${!master_addr}
-  master_port="METIS_WORKER_${MASTER_NODE_ID}_PORT"
-  master_port=${!master_port}
-  ports=(`echo $master_port | tr ',' ' '`)
-  master_port=${ports[0]}
-fi
+
+nnodes=1
+node_rank=0
+master_addr=127.0.0.1
+master_port=12345
+
+echo "[Using GPUs: $CUDA_VISIBLE_DEVICES, count: ${nproc_per_node}]"
+# if [ ! -z "$SINGLE" ] && [ "$SINGLE" != "0" ]; then
+#   echo "[single node alone] SINGLE=$SINGLE"
+#   nnodes=1
+#   node_rank=0
+#   nproc_per_node=1
+#   master_addr=127.0.0.1
+#   master_port=12345
+# else
+#   MASTER_NODE_ID=0
+#   nnodes=${ARNOLD_WORKER_NUM}
+#   node_rank=${ARNOLD_ID}
+#   master_addr="METIS_WORKER_${MASTER_NODE_ID}_HOST"
+#   master_addr=${!master_addr}
+#   master_port="METIS_WORKER_${MASTER_NODE_ID}_PORT"
+#   master_port=${!master_port}
+#   ports=(`echo $master_port | tr ',' ' '`)
+#   master_port=${ports[0]}
+# fi
 
 echo "[nproc_per_node: ${nproc_per_node}]"
 echo "[nnodes: ${nnodes}]"
@@ -34,7 +41,7 @@ echo "[master_port: ${master_port}]"
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=eth0
+# export NCCL_SOCKET_IFNAME=eth0
 
 BED=checkpoints
 LOCAL_OUT=local_output
@@ -47,8 +54,8 @@ export CUDA_TIMER_STREAM_KAFKA_CLUSTER=bmq_data_va
 export CUDA_TIMER_STREAM_KAFKA_TOPIC=megatron_cuda_timer_tracing_original_v2
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-wandb offline
-exp_name=debug_stage2_student
+swanlab online
+exp_name=debug_stage2_student_1024——2
 bed_path=checkpoints/${exp_name}/
 local_out_path=$LOCAL_OUT/${exp_name}
 
@@ -66,7 +73,7 @@ torchrun \
 --node_rank=${node_rank} \
 --master_addr=${master_addr} \
 --master_port=${master_port} \
-train.py \
+train_stage2_var_entropy.py \
 --ep=100 \
 --opt=adamw \
 --cum=3 \
@@ -87,11 +94,12 @@ train.py \
 --tblr=6e-3 \
 --pn 1M \
 --model=2bc8 \
---lbs=4 \
---workers=8 \
+--lbs=8 \
+--workers=1 \
 --Ct5=2048 \
 --vae_type 32 \
---vae_ckpt=weights/infinity_vae_d32_rdn_short.pth \
+--vae_ckpt=/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_2/checkpoints/model_step_249999.ckpt \
+--rush_resume=/workspace/CKPT/Infinity/infinity_2b_reg.pth  \
 --wp 0.00000001 \
 --wpe=1 \
 --dynamic_resolution_across_gpus 1 \
@@ -103,7 +111,7 @@ train.py \
 --always_training_scales 100 \
 --use_bit_label 1 \
 --zero=2 \
---save_model_iters_freq 100 \
+--save_model_iters_freq 1000 \
 --log_freq=50 \
 --checkpoint_type='torch' \
 --prefetch_factor=16 \
@@ -120,7 +128,7 @@ train.py \
 --proc_res_list=${proc_res_list} \
 --proc_memmap_cache_size=2 \
 \
---enable_student_entropy=1 \
+--enable_student_entropy=0 \
 --student_start_step=50000 \
 --student_hidden_dim=256 \
 --student_depth=4 \

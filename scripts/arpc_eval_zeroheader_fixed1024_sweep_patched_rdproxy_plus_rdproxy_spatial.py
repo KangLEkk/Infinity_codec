@@ -27,8 +27,21 @@ import numpy as np
 import torch
 from PIL import Image
 
+# Optional mask visualization (works for all strategies if codec exposes last_mask_debug)
+try:
+    from scripts.arpc_visualize_masks_all import visualize_from_codec
+except Exception:
+    try:
+        from arpc_visualize_masks_all import visualize_from_codec
+    except Exception:
+        visualize_from_codec = None
+
 # Reuse build & preprocessing utilities from the CLI
-from scripts.arpc_cli_zeroheader_fixed1024_sweep import build_codec, _resize_center_crop, _to_tensor_minus1_1
+try:
+    # preferred (includes rdproxy_spatial)
+    from scripts.arpc_cli_zeroheader_fixed1024_sweep_patched_rdproxy_plus_rdproxy_spatial import build_codec, _resize_center_crop, _to_tensor_minus1_1
+except Exception:
+    from scripts.arpc_cli_zeroheader_fixed1024_sweep_patched_rdproxy import build_codec, _resize_center_crop, _to_tensor_minus1_1
 
 
 # -------------------------
@@ -239,15 +252,20 @@ def main():
     p.add_argument("--work_dir", type=str, default="./_arpc_eval_work")
     p.add_argument("--save_recon_dir", type=str, default=None)
 
+    # visualization
+    p.add_argument("--save_vis", type=int, default=0, choices=[0, 1], help="Save masking visualization for each run (default=1).")
+    p.add_argument("--vis_root", type=str, default=None, help="Root directory for visualizations. Default: alongside recon images under recon_dir/vis/<image_stem>/")
+    p.add_argument("--vis_alpha", type=int, default=110, help="Overlay alpha for keep masks.")
+
     # shared ZERO-header assumptions
-    p.add_argument("--fixed_hw", type=int, default=1024)
+    p.add_argument("--fixed_hw", type=int, default=512)
     p.add_argument("--k_list", type=str, default="5")
 
     # sweep controls
     p.add_argument("--mask_strategies", type=str, default="none",
-                   help="Comma-separated list. e.g. 'none,entropy_spatial,entropy_channel,entropy_scale'")
+                   help="Comma-separated list. e.g. 'none,entropy_spatial,entropy_spatial_global,rdproxy_spatial,rdproxy_spatial_global,entropy_channel,entropy_scale'")
     p.add_argument("--keep_ratios", type=str, default="",
-                   help="Comma-separated list of keep_ratio values for strategies that use it (entropy_channel/spatial). "
+                   help="Comma-separated list of keep_ratio values for strategies that use it (entropy_channel/spatial/entropy_spatial_global/rdproxy_spatial/rdproxy_spatial_global). "
                         "e.g. '0.02,0.05,0.1'. Empty -> use only one run per strategy.")
     p.add_argument("--mask_params", type=str, default="{}",
                    help="Base JSON dict for mask params. keep_ratio will be overridden per run if --keep_ratios is set.")
@@ -276,22 +294,19 @@ def main():
     p.add_argument("--model_type", type=str, default="infinity_2b")
 
     p.add_argument("--use_bit_label", type=int, default=1, choices=[0, 1])
-    p.add_argument("--use_flex_attn", type=int, default=0, choices=[0, 1])
+    p.add_argument("--use_flex_attn", type=int, default=1, choices=[0, 1])
     p.add_argument("--bf16", type=int, default=0, choices=[0, 1])
-    p.add_argument("--pn", type=str, default="1M")
+
     p.add_argument("--add_lvl_embeding_only_first_block", type=int, default=1, choices=[0, 1])
     p.add_argument("--rope2d_each_sa_layer", type=int, default=1, choices=[0, 1])
     p.add_argument("--rope2d_normalized_by_hw", type=int, default=2, choices=[0, 1, 2])
 
-    p.add_argument("--checkpoint_type", type=str, default="torch")
-    p.add_argument("--enable_model_cache", type=int, default=1, choices=[0, 1])
     # metrics
     p.add_argument("--lpips_net", type=str, default="alex", choices=["alex", "vgg", "squeeze"])
 
     args = p.parse_args()
     args.bf16 = bool(int(args.bf16))
     args.use_flex_attn = bool(int(args.use_flex_attn))
-    args.enable_model_cache = bool(int(args.enable_model_cache))
 
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) else (
         "cpu" if args.device == "cpu" else "cuda"
@@ -338,6 +353,7 @@ def main():
     dists_fn = _try_build_dists(device)
 
     k_list = [int(x.strip()) for x in str(args.k_list).split(",") if x.strip()]
+    k_max = max(k_list) if k_list else 0
     images = list_images(args.data_dir)
     if not images:
         raise RuntimeError(f"No images found in {args.data_dir}")
@@ -347,8 +363,43 @@ def main():
         "mask_strategy","keep_ratio","active_bits",
         "k_transmit","bytes","bpp_img","prompt_bits","prompt_bpp","bpp",
         "psnr","ssim","ms_ssim","lpips","dists",
-        "enc_s","dec_s"
+        "enc_s","dec_s",
     ]
+    # Spatial mask stats (filled for entropy_spatial / entropy_spatial_global)
+    fields += ["pos_total","pos_keep_total","pos_drop_total","keep_ratio_eff"]
+    for si in range(int(k_max)):
+        fields += [f"pos_total_s{si}", f"pos_keep_s{si}", f"pos_drop_s{si}"]
+
+    # -------------------------------------------------
+    # Aggregation for summary means (grouped by strategy/k/keep_ratio/active_bits)
+    # -------------------------------------------------
+    numeric_cols = [
+        "bytes","bpp_img","prompt_bits","prompt_bpp","bpp",
+        "psnr","ssim","ms_ssim","lpips","dists","enc_s","dec_s",
+        "pos_total","pos_keep_total","pos_drop_total","keep_ratio_eff",
+    ]
+    for si in range(int(k_max)):
+        numeric_cols += [f"pos_total_s{si}", f"pos_keep_s{si}", f"pos_drop_s{si}"]
+
+    agg_sum = {}   # key -> {col: sum}
+    agg_cnt = {}   # key -> count per col
+    def _agg_add(key, row):
+        if key not in agg_sum:
+            agg_sum[key] = {c: 0.0 for c in numeric_cols}
+            agg_cnt[key] = {c: 0 for c in numeric_cols}
+        for c in numeric_cols:
+            v = row.get(c, "")
+            try:
+                if v == "" or v is None:
+                    continue
+                fv = float(v)
+                if np.isnan(fv):
+                    continue
+                agg_sum[key][c] += fv
+                agg_cnt[key][c] += 1
+            except Exception:
+                continue
+
 
     with open(args.out_csv, "w", newline="") as fcsv:
         w = csv.DictWriter(fcsv, fieldnames=fields)
@@ -369,7 +420,7 @@ def main():
                     ms = ms.strip()
 
                     # decide ratio sweep list for this strategy
-                    if ms in ("entropy_channel", "entropy_spatial") and keep_ratios:
+                    if ms in ("entropy_channel", "entropy_spatial", "entropy_spatial_global", "rdproxy_spatial", "rdproxy_spatial_global") and keep_ratios:
                         ratio_list = keep_ratios
                     else:
                         ratio_list = [None]
@@ -384,7 +435,7 @@ def main():
                             codec.active_bits_spec = str(args.active_bits or "all")
 
                         run_params = dict(base_params)
-                        if kr is not None and ms in ("entropy_channel", "entropy_spatial"):
+                        if kr is not None and ms in ("entropy_channel", "entropy_spatial", "entropy_spatial_global", "rdproxy_spatial", "rdproxy_spatial_global"):
                             run_params["keep_ratio"] = float(kr)
                         if hasattr(codec, "mask_params"):
                             codec.mask_params = run_params
@@ -436,6 +487,28 @@ def main():
                         y_u8 = codec.decompress(stream_path=stream_path, out_path=recon_path, prompt=prompt_text)
                         dec_s = time.time() - t1
 
+                        # -------------------------------------------------
+                        # Save visualization for masking (all strategies)
+                        # -------------------------------------------------
+                        if int(getattr(args, "save_vis", 1)) and visualize_from_codec is not None:
+                            try:
+                                # base image for overlay = the fixed_hw-cropped input PIL
+                                vis_root = getattr(args, "vis_root", None)
+                                if not vis_root:
+                                    # default: under recon_dir/vis/<stem> (strategy/k/ratio already in recon_dir)
+                                    vis_root = os.path.join(recon_dir, "vis")
+                                vis_dir = os.path.join(vis_root, stem)
+                                os.makedirs(vis_dir, exist_ok=True)
+
+                                # save raw debug object for later inspection
+                                md = getattr(codec, "last_mask_debug", None)
+                                if md is not None:
+                                    torch.save(md, os.path.join(vis_dir, "mask_debug.pt"))
+
+                                visualize_from_codec(codec, base_image=pil, out_dir=vis_dir, alpha=int(getattr(args, "vis_alpha", 110)))
+                            except Exception as e:
+                                print(f"[vis] skip ({name} ms={ms} k={k} kr={tag_kr}): {e}")
+
                         y_01 = (y_u8.permute(0,3,1,2).float().to(device) / 255.0).clamp(0,1)
 
                         psnr = _psnr(x_01, y_01)
@@ -443,6 +516,47 @@ def main():
                         ms_ssim = _ms_ssim(x_01, y_01)
                         lp = float("nan") if lpips_fn is None else float(lpips_fn(x_01, y_01))
                         di = float("nan") if dists_fn is None else float(dists_fn(x_01, y_01))
+
+                        # Spatial mask stats (from codec.last_mask_stats, if available)
+                        ms_stats = getattr(codec, "last_mask_stats", None)
+                        pos_total = pos_keep_total = pos_drop_total = keep_ratio_eff = ""
+                        per_total = per_keep = per_drop = None
+                        if isinstance(ms_stats, dict) and str(ms_stats.get("strategy", "")).lower() in ("entropy_spatial", "entropy_spatial_global", "rdproxy_spatial", "rdproxy_spatial_global"):
+                            try:
+                                pos_total = int(ms_stats.get("total_pos", 0))
+                                pos_keep_total = int(ms_stats.get("total_kept", 0))
+                                pos_drop_total = int(ms_stats.get("total_drop", 0))
+                                keep_ratio_eff = float(ms_stats.get("keep_ratio_effective", float("nan")))
+                                per_total = list(ms_stats.get("per_scale_total_pos", []) or [])
+                                per_keep = list(ms_stats.get("per_scale_kept_pos", []) or [])
+                                per_drop = list(ms_stats.get("per_scale_drop_pos", []) or [])
+                            except Exception:
+                                pass
+
+                        pos_by_scale = {}
+                        for si2 in range(int(k_max)):
+                            pt = pk = pd = ""
+                            if per_total is not None and si2 < len(per_total):
+                                try:
+                                    pt = int(per_total[si2])
+                                except Exception:
+                                    pt = ""
+                                if per_keep is not None and si2 < len(per_keep):
+                                    try:
+                                        pk = int(per_keep[si2])
+                                    except Exception:
+                                        pk = ""
+                                if per_drop is not None and si2 < len(per_drop):
+                                    try:
+                                        pd = int(per_drop[si2])
+                                    except Exception:
+                                        pd = ""
+                                elif pt != "" and pk != "":
+                                    pd = int(pt) - int(pk)
+                            pos_by_scale[f"pos_total_s{si2}"] = pt
+                            pos_by_scale[f"pos_keep_s{si2}"] = pk
+                            pos_by_scale[f"pos_drop_s{si2}"] = pd
+
 
                         row = dict(
                             image=name, H=H, W=W,
@@ -460,8 +574,14 @@ def main():
                             dists=float(di),
                             enc_s=float(enc_s),
                             dec_s=float(dec_s),
+                            pos_total=pos_total,
+                            pos_keep_total=pos_keep_total,
+                            pos_drop_total=pos_drop_total,
+                            keep_ratio_eff=keep_ratio_eff,
                         )
+                        row.update(pos_by_scale)
                         w.writerow(row)
+                        _agg_add((row["mask_strategy"], int(row["k_transmit"]), row["keep_ratio"], row["active_bits"]), row)
                         fcsv.flush()
 
                         msg = f"[{name}] ms={ms} kr={tag_kr} k={k} -> {bpp:.8f} bpp | PSNR {psnr:.2f} | SSIM {ssim:.4f} | MS-SSIM {ms_ssim:.4f}"
@@ -470,6 +590,35 @@ def main():
                         if dists_fn is not None:
                             msg += f" | DISTS {di:.4f}"
                         print(msg)
+
+
+    # -------------------------------------------------
+    # Write summary means
+    # -------------------------------------------------
+    out_sum = args.out_csv
+    if out_sum.lower().endswith(".csv"):
+        out_sum = out_sum[:-4] + ".summary.csv"
+    else:
+        out_sum = out_sum + ".summary.csv"
+
+    sum_fields = ["mask_strategy","k_transmit","keep_ratio","active_bits","n_images"] + [f"mean_{c}" for c in numeric_cols]
+    with open(out_sum, "w", newline="") as fsum:
+        wsum = csv.DictWriter(fsum, fieldnames=sum_fields)
+        wsum.writeheader()
+        for key in sorted(agg_sum.keys()):
+            ms, k, kr, ab = key
+            # pick a representative count (max among a few core metrics)
+            n_images = 0
+            for c in ("bpp", "psnr", "ssim"):
+                n_images = max(n_images, int(agg_cnt[key].get(c, 0)))
+            row_s = dict(mask_strategy=ms, k_transmit=int(k), keep_ratio=kr, active_bits=ab, n_images=int(n_images))
+            for c in numeric_cols:
+                cnt = int(agg_cnt[key].get(c, 0))
+                row_s[f"mean_{c}"] = "" if cnt <= 0 else float(agg_sum[key][c] / cnt)
+            wsum.writerow(row_s)
+
+    print(f"[summary] wrote: {out_sum}")
+
 
 if __name__ == "__main__":
     main()

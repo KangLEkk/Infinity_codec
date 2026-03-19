@@ -39,6 +39,7 @@ output
 output/*
 outputs/
 results/
+_arpc_eval_work/
 *.JPEG
 debug/
 weights

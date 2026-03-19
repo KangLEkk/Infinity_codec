@@ -87,20 +87,20 @@ class CKPTSaver(object):
                     self.sp_backup.wait(timeout=300); self.sp_backup.kill(); self.sp_backup.communicate()
                 self.time_stamp[0] = time.time()
 
-                def auto_sync(source_filename, target_filename):
-                    cmd = f'cp -r {source_filename} {target_filename}'
-                    self.sp_backup = subprocess.Popen(cmd, shell=True, bufsize=-1)
-                    print(f'[CKPTSaver] auto_save cmd: {cmd}', flush=True)
+                # def auto_sync(source_filename, target_filename):
+                #     cmd = f'cp -r {source_filename} {target_filename}'
+                #     self.sp_backup = subprocess.Popen(cmd, shell=True, bufsize=-1)
+                #     print(f'[CKPTSaver] auto_save cmd: {cmd}', flush=True)
 
-                local_files = glob.glob(f"{args.local_out_path}/*")
-                for filename in local_files:
-                    basename = os.path.basename(filename)
-                    target_filename = f'{args.bed}/{basename}'
-                    if basename.endswith('.pth'):
-                        if not os.path.isfile(target_filename):
-                            auto_sync(filename, target_filename)
-                    else:
-                        auto_sync(filename, target_filename)                    
+                # local_files = glob.glob(f"{args.local_out_path}/*")
+                # for filename in local_files:
+                #     basename = os.path.basename(filename)
+                #     target_filename = f'{args.bed}/{basename}'
+                #     if basename.endswith('.pth'):
+                #         if not os.path.isfile(target_filename):
+                #             auto_sync(filename, target_filename)
+                #     else:
+                #         auto_sync(filename, target_filename)                    
             cost = time.time() - stt
             print(f'[CKPTSaver][rank00] cost: {cost:.2f}s', flush=True)
         

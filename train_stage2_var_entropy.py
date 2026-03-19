@@ -63,7 +63,7 @@ def build_everything_from_args(args: arg_util.Args, saver):
     text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim, student_wo_ddp, student_ddp, student_optim = build_model_optimizer(args, vae_ckpt)
     
     # IMPORTANT: import heavy package `InfinityTrainer` after the Dataloader object creation/iteration to avoid OOM
-    from trainer import InfinityTrainer
+    from trainer_stage2_var_entropy import InfinityTrainer
     # build trainer
     trainer = InfinityTrainer(
         is_visualizer=dist.is_visualizer(), device=args.device, raw_scale_schedule=args.scale_schedule, resos=args.resos,
@@ -118,7 +118,7 @@ def build_model_optimizer(args, vae_ckpt):
 
     if args.rush_resume:
         print(f"{args.rush_resume=}")
-        cpu_d = torch.load(args.rush_resume, 'cpu')
+        cpu_d = torch.load(args.rush_resume, map_location='cpu', weights_only=False)
         if 'trainer' in cpu_d:
             state_dict = cpu_d['trainer']['gpt_fsdp']
             ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
@@ -266,12 +266,19 @@ def build_model_optimizer(args, vae_ckpt):
         if getattr(args, 'apply_spatial_patchify', 0):
             raise NotImplementedError('Tiny entropy student currently assumes apply_spatial_patchify=0.')
         from infinity.models.tiny_entropy_student import TinyEntropyStudent
+        
+        student_scale_schedule = getattr(args, 'scale_schedule', None)
+        if student_scale_schedule is None:
+            student_scale_schedule = getattr(gpt_wo_ddp, 'raw_scale_schedule', None)
+
+        student_num_scales = len(student_scale_schedule) if student_scale_schedule is not None else 16
+
         student_wo_ddp = TinyEntropyStudent(
             codebook_dim=gpt_wo_ddp.V // 2,
             text_dim=args.Ct5,
             hidden_dim=args.student_hidden_dim,
             depth=args.student_depth,
-            max_scales=max(32, len(args.scale_schedule) + 4),
+            max_scales=max(32, student_num_scales + 4),
             dropout=args.student_dropout,
         ).to(args.device)
         if args.zero:
@@ -358,7 +365,7 @@ def main_train(args: arg_util.Args):
     gc.collect(), torch.cuda.empty_cache()
     
     # import heavy packages after Dataloader object creation
-    from trainer import InfinityTrainer
+    from trainer_stage2_var_entropy import InfinityTrainer
     ret: Tuple[
         misc.TensorboardLogger, T5TokenizerFast, T5EncoderModel, InfinityTrainer,
         int, int, str, List[Tuple[float, float]], Optional[int], Optional[DataLoader], DataLoader,
@@ -503,7 +510,7 @@ def train_one_ep(
     text_tokenizer: T5TokenizerFast, text_encoder: T5EncoderModel, trainer, logging_params_milestone, enable_timeline_sdk: bool,
 ):
     # IMPORTANT: import heavy packages after the Dataloader object creation/iteration to avoid OOM
-    from trainer import InfinityTrainer
+    from trainer_stage2_var_entropy import InfinityTrainer
     from infinity.utils.lr_control import lr_wd_annealing
     trainer: InfinityTrainer
     
