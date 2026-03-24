@@ -136,7 +136,7 @@ def get_prompt_id(prompt):
 
 def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_fsdp'):
     print('[Save slim model]')
-    full_ckpt = torch.load(infinity_model_path, map_location=device)
+    full_ckpt = torch.load(infinity_model_path, map_location=device, weights_only=False)
     infinity_slim = full_ckpt['trainer'][key]
     # ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
     if not save_file:
@@ -209,7 +209,7 @@ def load_infinity(
 
         print(f'[Load Infinity weights]')
         if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device)
+            state_dict = torch.load(model_path, map_location=device, weights_only=False)
             print(infinity_test.load_state_dict(state_dict))
         elif checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint
@@ -281,10 +281,10 @@ def load_transformer(vae, args):
     model_path = args.model_path
     if args.checkpoint_type == 'torch': 
         # copy large model to local; save slim to local; and copy slim to nas; load local slim model
-        if osp.exists(args.cache_dir):
-            local_model_path = osp.join(args.cache_dir, 'tmp', model_path.replace('/', '_'))
-        else:
-            local_model_path = model_path
+        # if osp.exists(args.cache_dir):
+        #     local_model_path = osp.join(args.cache_dir, 'tmp', model_path.replace('/', '_'))
+        # else:
+        local_model_path = model_path
         if args.enable_model_cache:
             slim_model_path = model_path.replace('ar-', 'slim-')
             local_slim_model_path = local_model_path.replace('ar-', 'slim-')
@@ -370,7 +370,7 @@ def add_common_arguments(parser):
     parser.add_argument('--use_flex_attn', type=int, default=0, choices=[0,1])
     parser.add_argument('--enable_positive_prompt', type=int, default=0, choices=[0,1])
     parser.add_argument('--cache_dir', type=str, default='/dev/shm')
-    parser.add_argument('--enable_model_cache', type=int, default=0, choices=[0,1])
+    parser.add_argument('--enable_model_cache', type=int, default=1, choices=[0,1])
     parser.add_argument('--checkpoint_type', type=str, default='torch')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])

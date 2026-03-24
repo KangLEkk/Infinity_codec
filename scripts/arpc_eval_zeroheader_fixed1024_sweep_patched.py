@@ -225,10 +225,76 @@ def _get_caption(img_path: str, by_path: dict, by_base: dict, fallback: str) -> 
         return by_base[base]
     return fallback
 
+def _encode_prompt_ids(tokenizer, prompt: str, max_len: int = 77):
+    """Encode prompt -> token ids. Works for open_clip tokenizer and HF tokenizer."""
+    if tokenizer is None:
+        return []
+    try:
+        ids = tokenizer.encode(prompt)
+    except Exception:
+        try:
+            ids = tokenizer.encode(prompt, add_special_tokens=True)
+        except Exception:
+            return []
+    if max_len is not None and max_len > 0:
+        ids = ids[:max_len]
+    return list(map(int, ids))
 
-def _prompt_zlib_bits(prompt: str) -> int:
+
+def _try_build_hf_tokenizer(text_encoder_ckpt: str = ""):
+    """Try to build a tokenizer. Prefer open_clip tokenizer if available (nn_indices style)."""
+    try:
+        import prompt_inversion.open_clip as open_clip  # type: ignore
+        tok = open_clip.tokenizer._tokenizer
+        return tok, "open_clip"
+    except Exception:
+        pass
+    if text_encoder_ckpt:
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+            tok = AutoTokenizer.from_pretrained(text_encoder_ckpt)
+            return tok, "hf"
+        except Exception:
+            pass
+    return None, "none"
+
+def _arith_bits_from_ids(ids):
+    """Arithmetic-code token ids like nn_indices.py (char-level) and return payload bits."""
+    if ids is None or len(ids) == 0:
+        return 0
+    text = ",".join(map(str, ids))
+    # char freqs over digits and comma
+    char_freq = {}
+    for ch in text:
+        if ch.isdigit() or ch == ",":
+            char_freq[ch] = char_freq.get(ch, 0) + 1
+    if not char_freq:
+        return 0
+    try:
+        import torch
+        import torchac  # type: ignore
+
+        total = sum(char_freq.values())
+        unique_chars = sorted(char_freq.keys())
+        prob = [char_freq.get(c, 0) / total for c in unique_chars]
+
+        cdf = torch.zeros(len(unique_chars) + 1, dtype=torch.float32)
+        cdf[1:] = torch.cumsum(torch.tensor(prob, dtype=torch.float32), dim=0)
+        cdf[-1] = 1.0
+
+        L = len(text)
+        cdf = cdf.view(1, 1, -1).expand(1, L, -1).contiguous()
+        sym = torch.tensor([unique_chars.index(ch) for ch in text], dtype=torch.int16).view(1, -1)
+
+        encoded = torchac.encode_float_cdf(cdf, sym, check_input_bounds=True)
+        return len(encoded) * 8
+    except Exception:
+        # fallback: zlib as approximation
+        return _prompt_zlib_bytes(text) * 8
+
+def _prompt_zlib_bytes(prompt: str) -> int:
     b = prompt.encode("utf-8", errors="ignore")
-    return len(zlib.compress(b)) * 8
+    return len(zlib.compress(b))
 
 
 def main():
@@ -255,11 +321,11 @@ def main():
                    help="Shared active bits spec (0-header). e.g. 'all' or '16'.")
 
     # prompt / captions
-    p.add_argument("--caption_json", type=str, default="")
+    p.add_argument("--caption_json", type=str, default="/workspace/data/caption/DIV2K_captions_768.json")
     p.add_argument("--prompt", type=str, default="a clear photo")
     p.add_argument("--print_prompts", type=int, default=0, choices=[0, 1])
     p.add_argument("--add_prompt_bits", type=int, default=1, choices=[0, 1])
-    p.add_argument("--prompt_bits_mode", type=str, default="zlib", choices=["zlib", "none"])
+    p.add_argument("--prompt_bits_mode", type=str, default="arith", choices=["arith", "zlib", "none"], help="How to estimate prompt bits.")
 
     # model / vae
     p.add_argument("--device", type=str, default="cuda", choices=["auto", "cuda", "cpu"])
@@ -269,7 +335,7 @@ def main():
 
     p.add_argument("--vae_ckpt", type=str, required=True)
     p.add_argument("--model_ckpt", type=str, required=True)
-    p.add_argument("--text_encoder_ckpt", type=str, default="google/flan-t5-xl")
+    p.add_argument("--text_encoder_ckpt", type=str, default="/workspace/CKPT/flan-t5-xl")
 
     p.add_argument("--tlen", type=int, default=512)
     p.add_argument("--text_channels", type=int, default=2048)
@@ -278,13 +344,18 @@ def main():
     p.add_argument("--use_bit_label", type=int, default=1, choices=[0, 1])
     p.add_argument("--use_flex_attn", type=int, default=0, choices=[0, 1])
     p.add_argument("--bf16", type=int, default=0, choices=[0, 1])
-
-    p.add_argument("--add_lvl_embeding_only_first_block", type=int, default=0, choices=[0, 1])
+    p.add_argument("--pn", type=str, default="1M")
+    p.add_argument("--add_lvl_embeding_only_first_block", type=int, default=1, choices=[0, 1])
     p.add_argument("--rope2d_each_sa_layer", type=int, default=1, choices=[0, 1])
     p.add_argument("--rope2d_normalized_by_hw", type=int, default=2, choices=[0, 1, 2])
 
+    p.add_argument("--checkpoint_type", type=str, default="torch")
+    p.add_argument("--enable_model_cache", type=int, default=1, choices=[0, 1])
+
     # metrics
     p.add_argument("--lpips_net", type=str, default="alex", choices=["alex", "vgg", "squeeze"])
+
+    p.add_argument("--keep_gpu_busy", type=int, default=1, choices=[0, 1])
 
     args = p.parse_args()
     args.bf16 = bool(int(args.bf16))
@@ -306,6 +377,12 @@ def main():
         except Exception as e:
             print(f"[caption] failed to load {args.caption_json}: {e}")
             caption_by_path, caption_by_base = None, None
+
+    tok, tok_kind = _try_build_hf_tokenizer(args.text_encoder_ckpt)
+    if tok is None:
+        print("[prompt] tokenizer not available; prompt bits will fallback to zlib/none")
+    else:
+        print(f"[prompt] tokenizer={tok_kind}")
 
     # build codec once; override k_transmit/mask each run
     args.k_transmit = 1
@@ -381,7 +458,11 @@ def main():
                 agg_cnt[key][c] += 1
             except Exception:
                 continue
+    
+    csv_filename = os.path.basename(args.out_csv) 
+    args.out_csv = os.path.join(args.save_recon_dir, csv_filename)
 
+    print(f"[*] CSV will be saved to: {args.out_csv}")
 
     with open(args.out_csv, "w", newline="") as fcsv:
         w = csv.DictWriter(fcsv, fieldnames=fields)
@@ -433,8 +514,15 @@ def main():
                             print(f"[prompt] {name} :: {prompt_text}")
 
                         prompt_bits = 0
-                        if args.prompt_bits_mode == "zlib" and int(args.add_prompt_bits):
-                            prompt_bits = _prompt_zlib_bits(prompt_text)
+                        # if args.prompt_bits_mode == "zlib" and int(args.add_prompt_bits):
+                        #     prompt_bits = _prompt_zlib_bits(prompt_text)
+                        prompt_ids = _encode_prompt_ids(tok, prompt_text, max_len=int(args.tlen))
+                        if args.prompt_bits_mode == "arith":
+                                prompt_bits = _arith_bits_from_ids(prompt_ids)
+                        elif args.prompt_bits_mode == "zlib":
+                            prompt_bits = _prompt_zlib_bytes(prompt_text) * 8
+                        else:
+                            prompt_bits = 0
                         prompt_bpp = (prompt_bits / (H * W)) if int(args.add_prompt_bits) else 0.0
 
                         tag_ms = ms.replace("/", "_")
@@ -577,7 +665,34 @@ def main():
                 row_s[f"mean_{c}"] = "" if cnt <= 0 else float(agg_sum[key][c] / cnt)
             wsum.writerow(row_s)
 
-    print(f"[summary] wrote: {out_sum}")
+    print(f"[*] Main CSV saved to: {args.out_csv}")
+    print(f"[*] Summary CSV saved to: {out_sum}")
+
+    if args.keep_gpu_busy == 1:
+        print("\n[*] 评估已完成。检测到 --keep_gpu_busy=1，进入无限循环以保持 GPU 活跃...")
+        
+        # 定义临时文件路径（循环中会不断覆盖这两个文件，避免占用存储空间）
+        dummy_stream = os.path.join(args.work_dir, "dummy_keep_alive.arpc")
+        dummy_recon = os.path.join(args.work_dir, "dummy_keep_alive.png")
+        
+        # 预加载第一张图片到显存，跳过不必要的磁盘 I/O
+        dummy_img_path = images[0]
+        pil = Image.open(dummy_img_path).convert("RGB")
+        pil = _resize_center_crop(pil, int(args.fixed_hw), int(args.fixed_hw))
+        dummy_x = _to_tensor_minus1_1(pil).to(device)
+        dummy_prompt = "keep gpu busy"
+
+        while True:
+            try:
+                # 仅执行模型的前向推理，不收集指标
+                codec.compress(img_B3HW=dummy_x, out_stream_path=dummy_stream, prompt=dummy_prompt)
+                _ = codec.decompress(stream_path=dummy_stream, out_path=dummy_recon, prompt=dummy_prompt)
+                
+                print("程序继续中，占用gpu...")
+            except Exception as e:
+                # 忽略可能的读写冲突或异常，确保循环不会因为偶发错误而中断
+                time.sleep(1)
+                pass
 
 
 if __name__ == "__main__":

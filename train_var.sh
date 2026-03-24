@@ -65,7 +65,7 @@ proc_data_path='/datasets/pixelprose/embedding_mmap'
 proc_res_list='1024'
 
 rm -rf ${bed_path}
-rm -rf ${local_out_path}
+# rm -rf ${local_out_path}
 
 torchrun \
 --nproc_per_node=${nproc_per_node} \
@@ -91,7 +91,7 @@ train_stage2_var_entropy.py \
 --task_type='t2i' \
 --bed=${bed_path} \
 --exp_name=${exp_name} \
---tblr=6e-3 \
+--tblr=6e-5 \
 --pn 1M \
 --model=2bc8 \
 --lbs=8 \

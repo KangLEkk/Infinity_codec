@@ -337,7 +337,7 @@ def main():
     p.add_argument("--use_flex_attn", type=int, default=0, choices=[0, 1])
     p.add_argument("--bf16", type=int, default=0, choices=[0, 1])
 
-    p.add_argument("--add_lvl_embeding_only_first_block", type=int, default=0, choices=[0, 1])
+    p.add_argument("--add_lvl_embeding_only_first_block", type=int, default=1, choices=[0, 1])
     p.add_argument("--rope2d_each_sa_layer", type=int, default=1, choices=[0, 1])
     p.add_argument("--rope2d_normalized_by_hw", type=int, default=2, choices=[0, 1, 2])
 

@@ -838,12 +838,13 @@ class ARPCZeroHeaderFixed1024:
             scale_schedule=scale_schedule,
             cfg_list=cfg_list,
             tau_list=tau_list,
-            top_k=0,
-            top_p=1.0,
+            top_k=900,
+            top_p=0.97,
             g_seed=self.seed,
             more_smooth=False,
             force_bitidx_per_scale=forced_bitidx_per_scale,
             force_mask_per_scale=forced_mask_per_scale,
+            do_sample=True
         )
 
         img_u8 = out["img_u8"]  # [1,H,W,3]
