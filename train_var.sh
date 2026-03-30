@@ -111,7 +111,7 @@ train_stage2_var_entropy.py \
 --always_training_scales 100 \
 --use_bit_label 1 \
 --zero=2 \
---save_model_iters_freq 1000 \
+--save_model_iters_freq 5000 \
 --log_freq=50 \
 --checkpoint_type='torch' \
 --prefetch_factor=16 \

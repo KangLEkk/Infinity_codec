@@ -1,5 +1,14 @@
 from compression.util import *
 from utils.arithmeticcoding import compress_to_bit_list
+import math
+import torch
+def calc_token_entropy(p_list):
+    ent = 0.0
+    for p in p_list:
+        if 0.0 < p < 1.0:
+            # 二分类信息熵公式: -p*log2(p) - (1-p)*log2(1-p)
+            ent += -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+    return ent
 
 def get_prob(infinity, vae, vae_scale_schedule, prompt, text_tokenizer, text_encoder, gt_ls_Bl, tau_list=0.5, cfg_insertion_layer=[0]):
     if not isinstance(tau_list, list):
@@ -109,3 +118,51 @@ def encoding(args, infinity, vae, scale_schedule, text, text_tokenizer, text_enc
 
     return trans_list, help_list, bpp
 
+# def encoding(args, infinity, vae, scale_schedule, text, text_tokenizer, text_encoder, gt_ms_idx_Bl):
+#     prob_list = get_prob(infinity, vae, scale_schedule, text, text_tokenizer, text_encoder, gt_ms_idx_Bl)
+#     trans_list = []
+#     help_list = []
+#     bpp_list = []
+
+#     # ================= 新增：自适应 Mask 核心配置 =================
+#     START_SCALE = 8         # 从第几个尺度开始启用截断
+#     ENTROPY_THRESHOLD = 12.0 # 信息熵阈值
+
+#     sum_len = 0
+#     for i in range(len(gt_ms_idx_Bl)):
+#         gt_idx = gt_ms_idx_Bl[i]
+#         prob = prob_list[i][:,0].cpu().tolist()
+#         gt_idx = gt_idx.view(-1,1).squeeze().cpu().tolist()
+#         arithmetic_bits = []
+#         hbits = []
+        
+#         for j in range(int(len(prob)/args.vae_type)):
+#             p_token = prob[j*args.vae_type:(j+1)*args.vae_type]
+#             gt_token = gt_idx[j*args.vae_type:(j+1)*args.vae_type]
+            
+#             # --- 核心：安全掩码逻辑 ---
+#             is_safe_to_mask = False
+#             if i >= START_SCALE:
+#                 token_entropy = calc_token_entropy(p_token)
+#                 if token_entropy < ENTROPY_THRESHOLD:
+#                     # 关键新增：模拟接收端，检查 Argmax 是否完美命中 Ground Truth
+#                     argmax_token = [0 if p > 0.5 else 1 for p in p_token]
+#                     if argmax_token == gt_token:
+#                         is_safe_to_mask = True # 只有完美命中，才敢不传！
+            
+#             if is_safe_to_mask:
+#                 hbits.append(2) # 暗号 2：安全丢弃，让接收端自行脑补
+#                 # 注意：这里千万不要往 arithmetic_bits 追加任何东西，这部分码率彻底省下了！
+#             else:
+#                 bits = compress_to_bit_list(gt_token, p_token)
+#                 if len(bits) < args.vae_type:
+#                     arithmetic_bits.append(bits)
+#                     hbits.append(0)
+#                 else:
+#                     arithmetic_bits.append(gt_token)
+#                     hbits.append(1)
+                    
+#         trans_list.append(arithmetic_bits)
+#         help_list.append(hbits)
+
+#     return trans_list, help_list, bpp_list

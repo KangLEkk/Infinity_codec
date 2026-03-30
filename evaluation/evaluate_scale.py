@@ -154,9 +154,9 @@ def _save_output(obj: dict, out_path: Path):
 
 def parse_args(argv):
     p = argparse.ArgumentParser("Evaluate scale_0 to scale_12 results.")
-    p.add_argument("--root", type=str, default="/data/home/keanle/ARPC/rec_img/DIV2K",
+    p.add_argument("--root", type=str, default="/workspace/Infinity_codec/results/DIV2K_dynamic_18000",
                    help="Root folder containing scale_X directories.")
-    p.add_argument("--gt_dir", type=str, default="/data/home/keanle/datasets/DIV2K_1024",
+    p.add_argument("--gt_dir", type=str, default="/workspace/data/DIV2K_1024",
                    help="Ground-truth folder")
     p.add_argument("--scales", nargs="*", default=[],
                    help="Optional: specify scale folders explicitly, e.g. scale_0 scale_1 ...")
@@ -167,8 +167,8 @@ def parse_args(argv):
                    help="Compute FID/KID only if matched pairs >= this value (default: 51)")
     p.add_argument("--codec_name", type=str, default="ARPC_scales",
                    help="Prefix for output keys, default: ARPC_scales")
-    p.add_argument("--out", type=str, default="arpc_scale_results.py",
-                   help="Output path (.py or .json). Default: arpc_scale_results.py")
+    p.add_argument("--out", type=str, default="arpc_scale_results_18000.py",
+                   help="Output path (.py or .json). Default: arpc_scale_results_dynamic.py")
     p.add_argument("--x_axis_mode", type=str, default="index", choices=["name", "index"],
                    help='How to fill the list: name -> ["scale_0",...], index -> [0,1,...]')
     return p.parse_args(argv)

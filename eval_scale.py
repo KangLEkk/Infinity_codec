@@ -2,12 +2,14 @@ import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["CC"]  = "gcc"
 os.environ["CXX"] = "g++"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 sys.path.append("/workspace/Infinity_codec")
 
 import torch, torchvision
 import zlib  # Added for zlib prompt compression
 import time  # Added for the infinite keep-alive loop
+import re
 torch.cuda.set_device(0)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -171,12 +173,13 @@ def cal_score(gt_leak, rec_path, device):
 
 if __name__ == "__main__":
 
-    model_path='/workspace/Infinity_codec/local_output/debug_stage2_student_1024——2/ar-ckpt-giter013K-ep0-iter13000-last.pth'
+# /datasets/DIV2K_valid_HR
+    initial_model_path='/workspace/Infinity_codec/local_output/debug_stage2_student_1024——2/ar-ckpt-giter032K-ep0-iter32000-last.pth'
     vae_path='/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_2/checkpoints/model_step_249999.ckpt'
     text_encoder_ckpt = '/workspace/CKPT/flan-t5-xl'
     args=argparse.Namespace(
         pn='1M',
-        model_path=model_path,
+        model_path=initial_model_path,
         cfg_insertion_layer=0,
         vae_type=32,
         vae_path=vae_path,
@@ -197,7 +200,7 @@ if __name__ == "__main__":
         checkpoint_type='torch',
         seed=0,
         bf16=0,
-        rec_path='/workspace/Infinity_codec/results/DIV2K_3',
+        rec_path='',
         
         # Args for prompt compression
         add_prompt_bits=1,
@@ -211,85 +214,125 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
     vae = load_visual_tokenizer(args)
-    infinity = load_transformer(vae, args)
+    # infinity = load_transformer(vae, args)
 
     json_data = []
     with open('/workspace/ARPC/data/DIV2K.json', 'rt') as f:
         for line in f:
             json_data.append(json.loads(line))
 
-    base_rec_path = args.rec_path
-    if not os.path.exists(base_rec_path):
-        os.makedirs(base_rec_path)
+    # 解析基础路径和初始 iter
+    model_dir = os.path.dirname(initial_model_path)
+    base_filename = os.path.basename(initial_model_path)
 
-    all_scales_stats = {}
+    # 匹配 -iter15000- 这种格式，防止匹配到前缀的 giter015K
+    match = re.search(r'-iter(\d+)-', base_filename)
+    if not match:
+        raise ValueError("无法在给定的 initial_model_path 中找到有效的 '-iterXXXX-' 结构。")
+    
+    current_iter = int(match.group(1))
 
-    for data in json_data:
-        img_path, text = data['img_path'], data['txt']
-        img_name = img_path.split('/')[-1] 
-        
-        inp_B3HW = load_img(img_path, args)
-        b, c, h, w = inp_B3HW.shape
-        h_div_w = h / w
-        h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - h_div_w))]
-        scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
-        scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
-        scale_q = [(scale_schedule[i][0], scale_schedule[i][1], scale_schedule[i][2], 
-                    int((i+1)//((len(scale_schedule)//3)+1)+2)) for i in range(len(scale_schedule))]
-        
-        # Prompt bits
-        prompt_bits = 0
-        if args.add_prompt_bits:
-            prompt_ids = _encode_prompt_ids(text_tokenizer, text, max_len=args.tlen)
-            if args.prompt_bits_mode == "arith":
-                prompt_bits = _arith_bits_from_ids(prompt_ids)
-            elif args.prompt_bits_mode == "zlib":
-                prompt_bits = _prompt_zlib_bytes(text) * 8
-                
-        prompt_bpp = prompt_bits / (h * w) if args.add_prompt_bits else 0.0
-        
-        trans_list, help_list, bpp, gt_ms_idx_Bl = compress(
-            args, vae, scale_schedule, scale_q, infinity, 
-            text_tokenizer, text_encoder, img_path, text
-        )
-        
-        print(f"Processing {img_name}... [Prompt Bits: {prompt_bits} | Prompt BPP: {prompt_bpp:.6f}]")
-        img_bpps = decompress_modified(
-            args, infinity, vae, scale_schedule, text, 
-            text_tokenizer, text_encoder, gt_ms_idx_Bl, 
-            base_rec_path, img_name, trans_list, help_list, device,
-            h, w, prompt_bpp
-        )
-        for idx, bpp_val in enumerate(img_bpps):
-            if idx not in all_scales_stats:
-                all_scales_stats[idx] = []
-            all_scales_stats[idx].append(bpp_val)
+    # ==========================================
+    # 开始自动化测试循环
+    # ==========================================
+    while True:
+        # 1. 构造当前要测试的模型名称和路径
+        current_filename = re.sub(r'-iter\d+-', f'-iter{current_iter}-', base_filename)
+        current_model_path = os.path.join(model_dir, current_filename)
+
+        # 2. 检查模型是否存在，不存在则结束测试并进入 GPU 保持模式
+        if not os.path.exists(current_model_path):
+            print(f"\n[*] 模型未找到: {current_model_path}")
+            print("[*] 所有可用模型已测试完毕。退出测试循环。")
+            break
+
+        print(f"\n{'='*60}")
+        print(f"[*] 开始测试模型: {current_filename} (Iter: {current_iter})")
+        print(f"{'='*60}")
+
+        # 3. 动态更新 args
+        args.model_path = current_model_path
+        args.rec_path = f'/workspace/Infinity_codec/results/DIV2K_dynamic_{current_iter}'
+
+        if not os.path.exists(args.rec_path):
+            os.makedirs(args.rec_path)
+
+        # 4. 重新加载对应权重的 infinity 模型
+        infinity = load_transformer(vae, args)
+        all_scales_stats = {}
+
+        # 5. 执行数据集评估
+        for data in json_data:
+            img_path, text = data['img_path'], data['txt']
+            img_name = img_path.split('/')[-1] 
             
-        print(f"Finished {img_name}, current scales total bpp: {[f'{b:.8f}' for b in img_bpps]}")
+            inp_B3HW = load_img(img_path, args)
+            b, c, h, w = inp_B3HW.shape
+            h_div_w = h / w
+            h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - h_div_w))]
+            scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
+            scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
+            scale_q = [(scale_schedule[i][0], scale_schedule[i][1], scale_schedule[i][2], 
+                        int((i+1)//((len(scale_schedule)//3)+1)+2)) for i in range(len(scale_schedule))]
+            
+            # Prompt bits
+            prompt_bits = 0
+            if args.add_prompt_bits:
+                prompt_ids = _encode_prompt_ids(text_tokenizer, text, max_len=args.tlen)
+                if args.prompt_bits_mode == "arith":
+                    prompt_bits = _arith_bits_from_ids(prompt_ids)
+                elif args.prompt_bits_mode == "zlib":
+                    prompt_bits = _prompt_zlib_bytes(text) * 8
+                    
+            prompt_bpp = prompt_bits / (h * w) if args.add_prompt_bits else 0.0
+            
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                trans_list, help_list, bpp, gt_ms_idx_Bl = compress(
+                    args, vae, scale_schedule, scale_q, infinity, 
+                    text_tokenizer, text_encoder, img_path, text
+                )
+                
+                print(f"Processing {img_name}... [Prompt Bits: {prompt_bits} | Prompt BPP: {prompt_bpp:.6f}]")
+                img_bpps = decompress_modified(
+                    args, infinity, vae, scale_schedule, text, 
+                    text_tokenizer, text_encoder, gt_ms_idx_Bl, 
+                    args.rec_path, img_name, trans_list, help_list, device,
+                    h, w, prompt_bpp
+                )
+            for idx, bpp_val in enumerate(img_bpps):
+                if idx not in all_scales_stats:
+                    all_scales_stats[idx] = []
+                all_scales_stats[idx].append(bpp_val)
+                
+            print(f"Finished {img_name}, current scales total bpp: {[f'{b:.8f}' for b in img_bpps]}")
 
-    final_summary = []
-    for idx, bpps in all_scales_stats.items():
-        avg_bpp = np.mean(bpps)
-        final_summary.append({
-            "scale": idx,
-            "avg_bpp": avg_bpp,
-            "img_count": len(bpps)
-        })
-        print(f"Scale {idx}: Average BPP = {avg_bpp:.4f}")
+        # 6. 保存当前模型的总结
+        final_summary = []
+        for idx, bpps in all_scales_stats.items():
+            avg_bpp = np.mean(bpps)
+            final_summary.append({
+                "scale": idx,
+                "avg_bpp": avg_bpp,
+                "img_count": len(bpps)
+            })
+            print(f"Scale {idx}: Average BPP = {avg_bpp:.4f}")
 
-    df_summary = pd.DataFrame(final_summary)
-    df_summary.to_csv(os.path.join(args.rec_path, "overall_bpp_stats.csv"), index=False)
-
-    # --- GPU Keep-Alive Logic ---
-    if getattr(args, 'keep_gpu_busy', 0) == 1:
-        print("\n[*] 评估已完成。检测到 keep_gpu_busy=1，进入无限循环以保持 GPU 活跃...")
+        df_summary = pd.DataFrame(final_summary)
+        df_summary.to_csv(os.path.join(args.rec_path, "overall_bpp_stats.csv"), index=False)
         
-        # 取第一张图作为循环测试的数据，避免 I/O 开销
+        # 7. iter 自增 1000，进入下一轮探测
+        current_iter += 1000
+
+    # ==========================================
+    # 退出测试后，进入 GPU Keep-Alive 逻辑
+    # ==========================================
+    if getattr(args, 'keep_gpu_busy', 0) == 1:
+        print("\n[*] 检测到 keep_gpu_busy=1，进入无限循环以保持 GPU 活跃...")
+        
         if len(json_data) > 0:
             dummy_data = json_data[0]
             dummy_img_path, dummy_text = dummy_data['img_path'], dummy_data['txt']
             
-            # 预计算尺度信息
             dummy_inp = load_img(dummy_img_path, args)
             _, _, dummy_h, dummy_w = dummy_inp.shape
             dummy_h_div_w = dummy_h / dummy_w
@@ -301,7 +344,7 @@ if __name__ == "__main__":
             
             while True:
                 try:
-                    # 仅执行模型推理，不保存图片或计算指标
+                    # 使用循环中加载的最后一个 infinity 模型进行空跑
                     trans_list, help_list, _, gt_ms_idx_Bl = compress(
                         args, vae, dummy_scale_schedule, dummy_scale_q, infinity, 
                         text_tokenizer, text_encoder, dummy_img_path, dummy_text
@@ -312,6 +355,103 @@ if __name__ == "__main__":
                         _ = decompress_cfg(infinity, vae, dummy_scale_schedule, dummy_text, text_tokenizer, text_encoder, gt_leak, dec_idx)
                         
                 except Exception as e:
-                    # 忽略偶发异常，确保循环不中断退出
                     time.sleep(1)
                     pass
+
+    # base_rec_path = args.rec_path
+    # if not os.path.exists(base_rec_path):
+    #     os.makedirs(base_rec_path)
+
+    # all_scales_stats = {}
+
+    # for data in json_data:
+    #     img_path, text = data['img_path'], data['txt']
+    #     img_name = img_path.split('/')[-1] 
+        
+    #     inp_B3HW = load_img(img_path, args)
+    #     b, c, h, w = inp_B3HW.shape
+    #     h_div_w = h / w
+    #     h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - h_div_w))]
+    #     scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
+    #     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
+    #     scale_q = [(scale_schedule[i][0], scale_schedule[i][1], scale_schedule[i][2], 
+    #                 int((i+1)//((len(scale_schedule)//3)+1)+2)) for i in range(len(scale_schedule))]
+        
+    #     # Prompt bits
+    #     prompt_bits = 0
+    #     if args.add_prompt_bits:
+    #         prompt_ids = _encode_prompt_ids(text_tokenizer, text, max_len=args.tlen)
+    #         if args.prompt_bits_mode == "arith":
+    #             prompt_bits = _arith_bits_from_ids(prompt_ids)
+    #         elif args.prompt_bits_mode == "zlib":
+    #             prompt_bits = _prompt_zlib_bytes(text) * 8
+                
+    #     prompt_bpp = prompt_bits / (h * w) if args.add_prompt_bits else 0.0
+        
+    #     trans_list, help_list, bpp, gt_ms_idx_Bl = compress(
+    #         args, vae, scale_schedule, scale_q, infinity, 
+    #         text_tokenizer, text_encoder, img_path, text
+    #     )
+        
+    #     print(f"Processing {img_name}... [Prompt Bits: {prompt_bits} | Prompt BPP: {prompt_bpp:.6f}]")
+    #     img_bpps = decompress_modified(
+    #         args, infinity, vae, scale_schedule, text, 
+    #         text_tokenizer, text_encoder, gt_ms_idx_Bl, 
+    #         base_rec_path, img_name, trans_list, help_list, device,
+    #         h, w, prompt_bpp
+    #     )
+    #     for idx, bpp_val in enumerate(img_bpps):
+    #         if idx not in all_scales_stats:
+    #             all_scales_stats[idx] = []
+    #         all_scales_stats[idx].append(bpp_val)
+            
+    #     print(f"Finished {img_name}, current scales total bpp: {[f'{b:.8f}' for b in img_bpps]}")
+
+    # final_summary = []
+    # for idx, bpps in all_scales_stats.items():
+    #     avg_bpp = np.mean(bpps)
+    #     final_summary.append({
+    #         "scale": idx,
+    #         "avg_bpp": avg_bpp,
+    #         "img_count": len(bpps)
+    #     })
+    #     print(f"Scale {idx}: Average BPP = {avg_bpp:.4f}")
+
+    # df_summary = pd.DataFrame(final_summary)
+    # df_summary.to_csv(os.path.join(args.rec_path, "overall_bpp_stats.csv"), index=False)
+
+    # # --- GPU Keep-Alive Logic ---
+    # if getattr(args, 'keep_gpu_busy', 0) == 1:
+    #     print("\n[*] 评估已完成。检测到 keep_gpu_busy=1，进入无限循环以保持 GPU 活跃...")
+        
+    #     # 取第一张图作为循环测试的数据，避免 I/O 开销
+    #     if len(json_data) > 0:
+    #         dummy_data = json_data[0]
+    #         dummy_img_path, dummy_text = dummy_data['img_path'], dummy_data['txt']
+            
+    #         # 预计算尺度信息
+    #         dummy_inp = load_img(dummy_img_path, args)
+    #         _, _, dummy_h, dummy_w = dummy_inp.shape
+    #         dummy_h_div_w = dummy_h / dummy_w
+    #         dummy_h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - dummy_h_div_w))]
+    #         dummy_scale_schedule = dynamic_resolution_h_w[dummy_h_div_w_template_][args.pn]['scales']
+    #         dummy_scale_schedule = [(1, dummy_h, dummy_w) for (_, dummy_h, dummy_w) in dummy_scale_schedule]
+    #         dummy_scale_q = [(dummy_scale_schedule[i][0], dummy_scale_schedule[i][1], dummy_scale_schedule[i][2], 
+    #                     int((i+1)//((len(dummy_scale_schedule)//3)+1)+2)) for i in range(len(dummy_scale_schedule))]
+            
+    #         while True:
+    #             try:
+    #                 # 仅执行模型推理，不保存图片或计算指标
+    #                 trans_list, help_list, _, gt_ms_idx_Bl = compress(
+    #                     args, vae, dummy_scale_schedule, dummy_scale_q, infinity, 
+    #                     text_tokenizer, text_encoder, dummy_img_path, dummy_text
+    #                 )
+                    
+    #                 dec_idx = decoding(args, infinity, vae, dummy_scale_schedule, dummy_text, text_tokenizer, text_encoder, gt_ms_idx_Bl, trans_list, help_list)
+    #                 for gt_leak in range(0, len(gt_ms_idx_Bl)):
+    #                     _ = decompress_cfg(infinity, vae, dummy_scale_schedule, dummy_text, text_tokenizer, text_encoder, gt_leak, dec_idx)
+                        
+    #             except Exception as e:
+    #                 # 忽略偶发异常，确保循环不中断退出
+    #                 time.sleep(1)
+    #                 pass
