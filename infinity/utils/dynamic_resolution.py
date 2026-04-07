@@ -107,6 +107,6 @@ if __name__ == '__main__':
         for total_pixels in dynamic_resolution_h_w[h_div_w_template]:
             scales = np.array(dynamic_resolution_h_w[h_div_w_template][total_pixels]['scales'])
             seq_len = np.sum(scales[:,0]*scales[:,1])
-            if total_pixels == '2M':
+            if total_pixels == '1M':
                 string = f'{h_div_w_template}, {total_pixels}, {dynamic_resolution_h_w[h_div_w_template][total_pixels]}, seq_len: {seq_len}'.replace(', ', ',')
                 print(string)

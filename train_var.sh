@@ -55,7 +55,7 @@ export CUDA_TIMER_STREAM_KAFKA_TOPIC=megatron_cuda_timer_tracing_original_v2
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 swanlab online
-exp_name=debug_stage2_student_1024——2
+exp_name=debug_stage2_student_1024_3
 bed_path=checkpoints/${exp_name}/
 local_out_path=$LOCAL_OUT/${exp_name}
 
@@ -98,7 +98,7 @@ train_stage2_var_entropy.py \
 --workers=1 \
 --Ct5=2048 \
 --vae_type 32 \
---vae_ckpt=/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_2/checkpoints/model_step_249999.ckpt \
+--vae_ckpt=/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_8bs_dynamic/checkpoints/model_step_249999.ckpt \
 --rush_resume=/workspace/CKPT/Infinity/infinity_2b_reg.pth  \
 --wp 0.00000001 \
 --wpe=1 \
@@ -111,7 +111,7 @@ train_stage2_var_entropy.py \
 --always_training_scales 100 \
 --use_bit_label 1 \
 --zero=2 \
---save_model_iters_freq 5000 \
+--save_model_iters_freq 4000 \
 --log_freq=50 \
 --checkpoint_type='torch' \
 --prefetch_factor=16 \

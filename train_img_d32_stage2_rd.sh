@@ -16,7 +16,7 @@ fi
 
 PROC_DIR=${PROC_DIR:-"/datasets/pixelprose/embedding_mmap"}
 PROC_VAL_DIR=${PROC_VAL_DIR:-"/datasets/pixelprose/div2k_test_embedding_mmap"}
-OUTDIR=${OUTDIR:-"outputs/bitvae_tok_stage1_dino0.1_8bs"}
+OUTDIR=${OUTDIR:-"outputs/bitvae_tok_stage1_dino0.1_8bs_dynamic"}
 
 # --nnodes=$NODE_NUM \
 # export MASTER_PORT=$((29500 + RANDOM % 100)) 
@@ -38,7 +38,7 @@ CUDA_VISIBLE_DEVICES=1,3 torchrun \
     --default_root_dir ${OUTDIR} --log_every 100 --ckpt_every 10000 --visu_every 5000 \
     --new_quant --lr_drop 45000 \
     --remove_residual_detach --use_lecam_reg_zero --base_ch_disc 128 --dis_lr_multiplier 2.0 --use_checkpoint \
-    --schedule_mode "dense" --use_stochastic_depth --drop_rate 0.5 --keep_last_quant --tokenizer 'flux' --quantizer_type 'MultiScaleBSQ' \
+    --schedule_mode "dynamic" --use_stochastic_depth --drop_rate 0.5 --keep_last_quant --tokenizer 'flux' --quantizer_type 'MultiScaleBSQ' \
     --pretrained "/workspace/CKPT/Infinity/infinity_vae_d32reg.pth" --not_load_optimizer \
     --rate_lambda 5.0 --rate_scale_mode uniform --rate_scale_alpha 2.0 --entropy_hidden 256 --entropy_resblocks 4 --entropy_heads 8 --entropy_mlp_ratio 4.0 --entropy_use_pos2d --prior_entropy_weight 0 --prior_entropy_start_scale 7 \
     --entropy_cond prev_sum  \

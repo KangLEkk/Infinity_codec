@@ -35,3 +35,21 @@ for ratio in full_ratio2hws:
         # deal with aspect_ratio_scale_list
         info_dict = {"ratio": ratio, "h": h * vae_stride, "w": w * vae_stride, "bs": bs_dict[leng]}
         aspect_ratio_scale_list.append(info_dict)
+
+# if __name__ == '__main__':
+#     for ratio in dynamic_resolution_h_w:
+#         # 第一个脚本的第二层 key 是宽度 W (即 pixel[1])
+#         for w_key in dynamic_resolution_h_w[ratio]:
+#             # 获取 scales 列表并转为 numpy 数组
+#             scales = np.array(dynamic_resolution_h_w[ratio][w_key]['scales'])
+            
+#             # 第一个脚本的 scale 格式为 (h, w)
+#             # 累加所有尺度的 h * w 得到总的 sequence length
+#             seq_len = np.sum(scales[:, 0] * scales[:, 1])
+            
+#             # 仿照第二个脚本拼接字符串并打印
+#             # 注：这里去掉了第二个脚本中 `if total_pixels == '2M':` 的限制。
+#             # 如果你想只打印特定宽度（例如 1024），可以取消下面 if 的注释：
+#             # if w_key == 1024:
+#             string = f'{ratio},{w_key},{dynamic_resolution_h_w[ratio][w_key]},seq_len:{seq_len}'.replace(', ', ',')
+#             print(string)

@@ -113,6 +113,7 @@ def get_latent2scale_schedule(T: int, H: int, W: int, mode="original"):
     }
     if mode == "dynamic":
         predefined_HW_Scales.update(predefined_HW_Scales_dynamic)
+        # print(predefined_HW_Scales)
     elif mode == "dense":
         predefined_HW_Scales[(16, 16)] = [(x, x) for x in range(1, 16+1)]
         predefined_HW_Scales[(32, 32)] = predefined_HW_Scales[(16, 16)] + [(20, 20), (24, 24), (28, 28), (32, 32)]
@@ -131,7 +132,8 @@ def get_latent2scale_schedule(T: int, H: int, W: int, mode="original"):
         predefined_HW_Scales[(32, 32)] = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (8, 8), (10, 10), (13, 13), (16, 16)]
         predefined_HW_Scales[(64, 64)] = [(1,1),(2,2),(4,4),(6,6),(8,8),(12,12),(16,16)]
 
-    predefined_T_Scales = [1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 17, 17, 17, 17]
+    # predefined_T_Scales = [1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 17, 17, 17, 17]
+    predefined_T_Scales = [1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 21]
     patch_THW_shape_per_scale = predefined_HW_Scales[(H, W)]
     if len(predefined_T_Scales) < len(patch_THW_shape_per_scale):
         # print("warning: the length of predefined_T_Scales is less than the length of patch_THW_shape_per_scale!")

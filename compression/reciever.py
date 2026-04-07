@@ -1,6 +1,176 @@
 from compression.util import *
 from utils.arithmeticcoding import decompress_from_bit_list, compress_to_bit_list
 import math
+from typing import Dict, Any, Tuple, Optional
+
+import torch
+
+
+import math
+from typing import Dict, Any, Tuple, Optional
+
+import torch
+
+
+def _relative_boundary_factor(
+    rel_stage: int,
+    boundary_temp_boost: float = 0.25,
+    boundary_decay: float = 0.55,
+    tail_cool_rate: float = 0.03,
+    tail_cool_start: int = 4,
+    tail_cool_min: float = 0.85,
+) -> float:
+    """
+    rel_stage:
+        当前尺度距离“最后一个已传输尺度”的相对距离。
+        - rel_stage = 1: 第一个缺失尺度（最关键）
+        - rel_stage = 2: 第二个缺失尺度
+        - ...
+
+    返回一个温度乘子：
+        - 第一个缺失尺度给更高温度
+        - 后续逐渐回落
+        - 再往后略微降温，避免高尺度过于随机
+    """
+    rel_stage = max(1, int(rel_stage))
+
+    # 第一个缺失尺度温度更高，后面指数衰减
+    boost = boundary_temp_boost * math.exp(-boundary_decay * float(rel_stage - 1))
+
+    # 到更后面的缺失尺度，略微偏保守
+    if rel_stage >= tail_cool_start:
+        cool = max(tail_cool_min, 1.0 - tail_cool_rate * float(rel_stage - tail_cool_start + 1))
+    else:
+        cool = 1.0
+
+    return (1.0 + boost) * cool
+
+
+def apply_entropy_adaptive_temperature(
+    raw_logits: torch.Tensor,
+    si: int,
+    last_observed_scale_idx: int,
+    selective_ratio: float = 0.20,
+    t0: float = 1.60,
+    alpha: float = 0.45,
+    theta: float = 0.55,
+    base_temperature: float = 0.85,
+    min_temperature: float = 0.10,
+    max_temperature: float = 2.50,
+    boundary_temp_boost: float = 0.25,
+    boundary_decay: float = 0.55,
+    tail_cool_rate: float = 0.03,
+    tail_cool_start: int = 4,
+    tail_cool_min: float = 0.85,
+    eps: float = 1e-10,
+    return_debug: bool = False,
+) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+    """
+    输入:
+        raw_logits: [B, seq_len, 64]
+            默认按 Infinity bitwise 格式解释为 [B, seq_len, 32, 2]
+        si:
+            当前正在生成的尺度 index
+        last_observed_scale_idx:
+            最后一个“已传输/已知”的尺度 index
+            例如传输了前 3 个 token map，则 last_observed_scale_idx = 2
+            若一个都没传，设为 -1
+        selective_ratio:
+            只对当前尺度中熵最高的前 selective_ratio 比例 token 做动态温度
+        t0, alpha, theta:
+            动态温度公式参数
+            T = t0 * exp(-H_norm / alpha) + theta
+            注意这里 H_norm 已经归一化到 [0, 1]
+        base_temperature:
+            对“不进行动态采样”的 token 使用的固定温度
+        min_temperature, max_temperature:
+            温度安全上下界
+
+    输出:
+        logits_scaled: [B, seq_len, 64]
+        debug_info: 可选调试信息
+    """
+    if raw_logits.ndim != 3:
+        raise ValueError(f"raw_logits should be [B, seq_len, 64], got shape={tuple(raw_logits.shape)}")
+    if raw_logits.size(-1) % 2 != 0:
+        raise ValueError(f"Last dim of raw_logits must be even, got {raw_logits.size(-1)}")
+
+    B, L, V = raw_logits.shape
+    num_bits = V // 2
+
+    # [B, L, 64] -> [B, L, 32, 2]
+    logits_bits = raw_logits.reshape(B, L, num_bits, 2)
+
+    # bit 概率
+    probs_bits = torch.softmax(logits_bits, dim=-1)
+
+    # 每个 bit 的熵，单位 nat，最大值 ln(2)
+    entropy_bits = -(probs_bits * torch.log(probs_bits.clamp_min(eps))).sum(dim=-1)  # [B, L, num_bits]
+
+    # 归一化到 [0, 1]
+    entropy_bits_norm = (entropy_bits / math.log(2.0)).clamp_(0.0, 1.0)  # [B, L, num_bits]
+
+    # token 级不确定性：对 32 个 bit 的归一化熵取均值
+    token_uncertainty = entropy_bits_norm.mean(dim=-1)  # [B, L]
+
+    # 相对缺失边界：第一个缺失尺度最重要
+    rel_stage = max(1, int(si - last_observed_scale_idx))
+    rel_factor = _relative_boundary_factor(
+        rel_stage=rel_stage,
+        boundary_temp_boost=boundary_temp_boost,
+        boundary_decay=boundary_decay,
+        tail_cool_rate=tail_cool_rate,
+        tail_cool_start=tail_cool_start,
+        tail_cool_min=tail_cool_min,
+    )
+
+    # bit-wise 动态温度
+    # 低熵 -> 温度更高一些
+    # 高熵 -> 温度更低一些
+    dynamic_temp_bits = t0 * torch.exp(-entropy_bits_norm / max(alpha, 1e-6)) + theta  # [B, L, num_bits]
+    dynamic_temp_bits = dynamic_temp_bits * rel_factor
+
+    # selective sampling: 只对最不确定的一部分 token 用动态温度
+    selective_ratio = float(max(0.0, min(1.0, selective_ratio)))
+    if selective_ratio <= 0.0:
+        use_dynamic_mask = torch.zeros_like(token_uncertainty, dtype=torch.bool)
+    elif selective_ratio >= 1.0:
+        use_dynamic_mask = torch.ones_like(token_uncertainty, dtype=torch.bool)
+    else:
+        # 每个 batch 样本内部单独算分位数阈值
+        threshold = torch.quantile(token_uncertainty, q=1.0 - selective_ratio, dim=1, keepdim=True)
+        use_dynamic_mask = token_uncertainty >= threshold  # [B, L]
+
+    # 未选中的 token 用固定低温
+    base_temp_bits = torch.full_like(dynamic_temp_bits, fill_value=base_temperature)
+
+    final_temp_bits = torch.where(
+        use_dynamic_mask.unsqueeze(-1),
+        dynamic_temp_bits,
+        base_temp_bits,
+    )
+
+    final_temp_bits = final_temp_bits.clamp_(min=min_temperature, max=max_temperature)
+
+    # 应用到 bit logits
+    logits_bits_scaled = logits_bits / final_temp_bits.unsqueeze(-1)  # [B, L, num_bits, 2]
+    logits_scaled = logits_bits_scaled.reshape_as(raw_logits)
+
+    if not return_debug:
+        return logits_scaled, None
+
+    debug_info = {
+        "rel_stage": rel_stage,
+        "rel_factor": rel_factor,
+        "token_uncertainty_mean": token_uncertainty.mean().item(),
+        "token_uncertainty_max": token_uncertainty.max().item(),
+        "dynamic_ratio": use_dynamic_mask.float().mean().item(),
+        "temp_mean": final_temp_bits.mean().item(),
+        "temp_min": final_temp_bits.min().item(),
+        "temp_max": final_temp_bits.max().item(),
+    }
+    return logits_scaled, debug_info
+
 
 def calc_token_entropy(p_list):
     ent = 0.0
@@ -24,7 +194,7 @@ def sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV: torch.Ten
     num_samples = abs(num_samples)
     return torch.multinomial(logits_BlV.softmax(dim=-1).view(-1, V), num_samples=num_samples, replacement=replacement, generator=rng).view(B, l, num_samples)
 
-def decompress_cfg(infinity, vae, vae_scale_schedule, prompt, text_tokenizer, text_encoder, gt_leak, gt_ls_Bl, cfg_list=3, tau_list=1, cfg_insertion_layer=[0]):
+def decompress_cfg(infinity, vae, vae_scale_schedule, prompt, text_tokenizer, text_encoder, gt_leak, gt_ls_Bl, cfg_list=3, tau_list=0.5, cfg_insertion_layer=[0]):
     # infinity.rng.manual_seed(9306)
     rng = infinity.rng
     if not isinstance(tau_list, list):
@@ -99,8 +269,53 @@ def decompress_cfg(infinity, vae, vae_scale_schedule, prompt, text_tokenizer, te
         # else:
         #     logits_BlV = infinity.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
 
-        # ---------- 替换为基于信息熵的动态温度采样 ----------
-        # 1. 获取纯净的原始 Logits (暂时不乘以静态的 1/tau)
+        # # ---------- 替换为基于信息熵的动态温度采样 ----------
+        # # 1. 获取纯净的原始 Logits (暂时不乘以静态的 1/tau)
+        # if (cfg != 1) and add_cfg_on_logits:
+        #     logits_all = infinity.get_logits(last_stage, cond_BD)
+        #     logits_cond = logits_all[:B]
+        #     logits_uncond = logits_all[B:]
+        #     raw_logits = cfg * logits_cond + (1 - cfg) * logits_uncond
+        # else:
+        #     raw_logits = infinity.get_logits(last_stage[:B], cond_BD[:B])
+
+        # # 2. 计算比特级信息熵 (Bitwise Entropy)
+        # # Infinity 的 raw_logits 形状通常为 [B, seq_len, 64] (32个bit，每个bit有2个状态)
+        # tmp_bs, tmp_seq_len = raw_logits.shape[:2]
+        
+        # # 将其 Reshape 为 [B, seq_len, 32, 2] 以便计算每个 Bit 的 Softmax 概率
+        # logits_bits = raw_logits.view(tmp_bs, tmp_seq_len, 32, 2)
+        # probs_bits = torch.softmax(logits_bits, dim=-1)
+        
+        # # 计算每个 Bit 的熵，并求和得到当前 Token 的总信息熵 epsilon
+        # # 论文公式: \epsilon = -\sum p_k * log(p_k)
+        # entropy_bits = -torch.sum(probs_bits * torch.log(probs_bits + 1e-10), dim=-1) # [B, seq_len, 32]
+        # epsilon = torch.sum(entropy_bits, dim=-1) # [B, seq_len]
+
+        # # 3. 基于熵的动态温度映射
+        # # 论文核心公式: T = T_0 * exp(-epsilon / alpha) + theta
+        # T_0 = 2.0     # 低熵区域的最大额外温度增益
+        # alpha = 8.0   # 衰减系数 (Infinity 32-bit 最大熵约22，alpha调大以匹配尺度)
+        # theta = 0.5   # 基础保障温度 (高熵区域的严格采样阈值)
+        
+        # T_dynamic = T_0 * torch.exp(-epsilon / alpha) + theta # [B, seq_len]
+        
+        # # 4. 结合论文中专门针对 Scale-wise 模型的尺度退火 (Scale-wise Decay)
+        # # 论文公式: T_s = T * [1 - beta * (s - S/2)]
+        # S_total = len(vae_scale_schedule)
+        # beta = 0.05 # 论文默认0.3，但因尺度多达13-15层，降低 beta 防止后期温度变为负数
+        # scale_decay = 1.0 - beta * (si - (S_total // 2))
+        
+        # # 防止超高尺度时温度跌破安全下限
+        # T_final = torch.clamp(T_dynamic * scale_decay, min=0.1) 
+        
+        # # 5. 将动态温度应用到 Logits 上进行重塑
+        # T_final = T_final.unsqueeze(-1) # [B, seq_len, 1] 广播到全部 64 维
+        # logits_BlV = raw_logits / T_final
+        # # ----------------------------------------------------
+        
+        # ---------- Relative-boundary + bitwise entropy adaptive temperature ----------
+        # 1. 获取原始 logits
         if (cfg != 1) and add_cfg_on_logits:
             logits_all = infinity.get_logits(last_stage, cond_BD)
             logits_cond = logits_all[:B]
@@ -109,41 +324,52 @@ def decompress_cfg(infinity, vae, vae_scale_schedule, prompt, text_tokenizer, te
         else:
             raw_logits = infinity.get_logits(last_stage[:B], cond_BD[:B])
 
-        # 2. 计算比特级信息熵 (Bitwise Entropy)
-        # Infinity 的 raw_logits 形状通常为 [B, seq_len, 64] (32个bit，每个bit有2个状态)
-        tmp_bs, tmp_seq_len = raw_logits.shape[:2]
-        
-        # 将其 Reshape 为 [B, seq_len, 32, 2] 以便计算每个 Bit 的 Softmax 概率
-        logits_bits = raw_logits.view(tmp_bs, tmp_seq_len, 32, 2)
-        probs_bits = torch.softmax(logits_bits, dim=-1)
-        
-        # 计算每个 Bit 的熵，并求和得到当前 Token 的总信息熵 epsilon
-        # 论文公式: \epsilon = -\sum p_k * log(p_k)
-        entropy_bits = -torch.sum(probs_bits * torch.log(probs_bits + 1e-10), dim=-1) # [B, seq_len, 32]
-        epsilon = torch.sum(entropy_bits, dim=-1) # [B, seq_len]
+        # 2. 设置“最后一个已传输尺度”
+        #    你需要把 transmitted_token_maps 改成你代码里真实的变量名
+        #    例如如果传输了前 k 个 token map，那么 last_observed_scale_idx = k - 1
+        #    如果一个都没传，就设成 -1
+        last_observed_scale_idx = gt_leak - 1
 
-        # 3. 基于熵的动态温度映射
-        # 论文核心公式: T = T_0 * exp(-epsilon / alpha) + theta
-        T_0 = 2.0     # 低熵区域的最大额外温度增益
-        alpha = 8.0   # 衰减系数 (Infinity 32-bit 最大熵约22，alpha调大以匹配尺度)
-        theta = 0.5   # 基础保障温度 (高熵区域的严格采样阈值)
-        
-        T_dynamic = T_0 * torch.exp(-epsilon / alpha) + theta # [B, seq_len]
-        
-        # 4. 结合论文中专门针对 Scale-wise 模型的尺度退火 (Scale-wise Decay)
-        # 论文公式: T_s = T * [1 - beta * (s - S/2)]
-        S_total = len(vae_scale_schedule)
-        beta = 0.05 # 论文默认0.3，但因尺度多达13-15层，降低 beta 防止后期温度变为负数
-        scale_decay = 1.0 - beta * (si - (S_total // 2))
-        
-        # 防止超高尺度时温度跌破安全下限
-        T_final = torch.clamp(T_dynamic * scale_decay, min=0.1) 
-        
-        # 5. 将动态温度应用到 Logits 上进行重塑
-        T_final = T_final.unsqueeze(-1) # [B, seq_len, 1] 广播到全部 64 维
-        logits_BlV = raw_logits / T_final
-        # ----------------------------------------------------
-        
+        # 3. 当前尺度用多大比例 token 做动态采样
+        #    第一个缺失尺度更激进，后面更保守
+        rel_stage = max(1, int(si - last_observed_scale_idx))
+        if rel_stage == 1:
+            selective_ratio = 0.50
+        elif rel_stage == 2:
+            selective_ratio = 0.30
+        else:
+            selective_ratio = 0.15
+
+        # 4. 应用新的动态温度
+        logits_BlV, temp_debug = apply_entropy_adaptive_temperature(
+            raw_logits=raw_logits,
+            si=si,
+            last_observed_scale_idx=last_observed_scale_idx,
+            selective_ratio=selective_ratio,
+
+            # 下面这组参数是“归一化熵”版本，不再是你原来 alpha=8.0 那套量纲
+            t0=1.60,
+            alpha=0.45,
+            theta=0.55,
+
+            # 非高不确定 token 的固定低温
+            base_temperature=0.5,
+
+            # 安全边界
+            min_temperature=0.10,
+            max_temperature=2.20,
+
+            # relative-boundary 调节
+            boundary_temp_boost=0.25,   # 第一个缺失尺度额外升温
+            boundary_decay=0.55,        # 升温衰减速度
+            tail_cool_rate=0.03,        # 后续尺度逐渐保守
+            tail_cool_start=4,          # 从第几个缺失尺度开始轻微降温
+            tail_cool_min=0.85,
+
+            return_debug=False,         # 调参数时可改成 True
+        )
+        # ----------------------------------------------------------------------------
+
 
         if infinity.use_bit_label:
             tmp_bs, tmp_seq_len = logits_BlV.shape[:2] #[bs, seq_len, 64]
