@@ -226,7 +226,7 @@ def insert_into_plot_script(plot_script_path, root_dir_name, entry_dict):
 
 def parse_args(argv):
     p = argparse.ArgumentParser("Evaluate and update RD plot script automatically.")
-    p.add_argument("--root", type=str, default="/workspace/Infinity_codec/results/dynamic/DIV2K_dynamic_21000",
+    p.add_argument("--root", type=str, default="/workspace/Infinity_codec/results/dynamic_3/DIV2K_dynamic_4000",
                    help="Root folder containing scale_X directories.")
     p.add_argument("--gt_dir", type=str, default="/workspace/data/DIV2K_1024",
                    help="Ground-truth folder")

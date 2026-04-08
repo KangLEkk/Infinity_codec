@@ -194,8 +194,8 @@ def decompress_modified(args, infinity, vae, scale_schedule, text, text_tokenize
 
 if __name__ == "__main__":
 
-    initial_model_path='/workspace/Infinity_codec/local_output/debug_stage2_student_1024——2/slim-ckpt-giter021K-ep0-iter21000-last.pth'
-    vae_path='/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_2/checkpoints/model_step_249999.ckpt'
+    initial_model_path='/workspace/Infinity_codec/local_output/debug_stage2_student_1024_3/ar-ckpt-giter004K-ep0-iter4000-last.pth'
+    vae_path='/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_8bs_dynamic/checkpoints/model_step_249999.ckpt'
     text_encoder_ckpt = '/workspace/CKPT/flan-t5-xl'
     
     args=argparse.Namespace(
@@ -280,7 +280,7 @@ if __name__ == "__main__":
 
         # 动态更新 args
         args.model_path = current_model_path
-        args.rec_path = f'/workspace/Infinity_codec/results/dynamic/DIV2K_dynamic_{current_iter}'
+        args.rec_path = f'/workspace/Infinity_codec/results/dynamic_3/DIV2K_dynamic_{current_iter}'
 
         if not os.path.exists(args.rec_path):
             os.makedirs(args.rec_path)
