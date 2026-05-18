@@ -209,20 +209,57 @@ def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_
 
 #     return rope2d_freqs_grid
 
-def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind):
-    qk = torch.stack((q, k), dim=0)  #(2, batch_size, heads, seq_len, head_dim)
+def apply_rotary_emb(
+    q,
+    k,
+    scale_schedule,
+    rope2d_freqs_grid,
+    pad_to_multiplier,
+    rope2d_normalized_by_hw,
+    scale_ind,
+    token_indices=None,
+    qkv_layout="auto",
+):
+    """
+    Supports both dense and sparse current-scale tokens.
+    q/k may be either [B, L, H, C] or [B, H, L, C].
+    token_indices: optional 1D tensor of indices inside the current scale grid.
+    """
+    # Normalize to BLHc before applying RoPE. Inferring the layout from shape
+    # alone breaks on tiny scales such as L=1, so callers can pass it explicitly.
+    if qkv_layout == "BLHc":
+        transposed = False
+    elif qkv_layout == "BHLc":
+        transposed = True
+    elif qkv_layout == "auto":
+        seq_dim = 1 if q.shape[1] >= q.shape[2] else 2
+        transposed = (seq_dim == 2)
+    else:
+        raise ValueError(f"Unknown qkv_layout={qkv_layout}")
+
+    if transposed:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+
+    qk = torch.stack((q, k), dim=0)  # (2, B, L, H, c)
     device_type = qk.device.type
     device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
     with torch.autocast(device_type=device_type, enabled=False):
-        seq_len = qk.shape[3]
+        seq_len = qk.shape[2]
         start = 0
         if scale_ind >= 1:
             assert len(scale_schedule[0]) == 3
-            start = np.sum([item[0] * item[1] * item[2] for item in scale_schedule[:scale_ind]])
+            start = int(np.sum([item[0] * item[1] * item[2] for item in scale_schedule[:scale_ind]]))
         key = str(tuple(scale_schedule))
+
+        if token_indices is not None:
+            token_indices = token_indices.reshape(-1).to(device=qk.device, dtype=torch.long)
+            seq_len = token_indices.numel()
+
         if key not in rope2d_freqs_grid:
-            # ✅ 未缓存的 schedule：现场计算 2D RoPE 并直接用（不查 rope2d_freqs_grid）
-            _, hh, ww = scale_schedule[scale_ind]
+            pt, hh, ww = scale_schedule[scale_ind]
+            if pt != 1:
+                hh = pt * hh
             cos, sin = _build_rope2d_cos_sin(
                 hh, ww,
                 dim=q.shape[-1],
@@ -231,30 +268,50 @@ def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier,
                 rope2d_normalized_by_hw=rope2d_normalized_by_hw,
             )
 
-            # 如果 attention 序列长度 L > hh*ww（可能有 padding），补齐 cos/sin
-            L = q.shape[-2]
-            hw = hh * ww
-            if L > hw:
-                pad = L - hw
-                cos_pad = torch.ones((1, 1, pad, q.shape[-1]), device=q.device, dtype=q.dtype)
-                sin_pad = torch.zeros((1, 1, pad, q.shape[-1]), device=q.device, dtype=q.dtype)
-                cos = torch.cat([cos, cos_pad], dim=2)
-                sin = torch.cat([sin, sin_pad], dim=2)
+            if token_indices is not None:
+                cos = cos[:, :, token_indices, :]
+                sin = sin[:, :, token_indices, :]
+            else:
+                L = q.shape[1]
+                hw = hh * ww
+                if L > hw:
+                    pad = L - hw
+                    cos_pad = torch.ones((1, 1, pad, q.shape[-1]), device=q.device, dtype=q.dtype)
+                    sin_pad = torch.zeros((1, 1, pad, q.shape[-1]), device=q.device, dtype=q.dtype)
+                    cos = torch.cat([cos, cos_pad], dim=2)
+                    sin = torch.cat([sin, sin_pad], dim=2)
 
             q = q * cos + _rotate_half(q) * sin
             k = k * cos + _rotate_half(k) * sin
+            if transposed:
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
             return q, k
 
-        rope2d_freqs_grid[str(tuple(scale_schedule))] = rope2d_freqs_grid[str(tuple(scale_schedule))].to(qk.device)
-        assert start+seq_len <= rope2d_freqs_grid[str(tuple(scale_schedule))].shape[4]
-        rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][:, :, :, :, start:start+seq_len] # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]
-        qk = qk.reshape(*qk.shape[:-1], -1, 2) #(2, batch_size, heads, seq_len, half_head_dim, 2)
+        rope2d_freqs_grid[key] = rope2d_freqs_grid[key].to(qk.device)
+        if token_indices is None:
+            assert start + seq_len <= rope2d_freqs_grid[key].shape[4]
+            rope_cache = rope2d_freqs_grid[key][:, :, :, :, start:start+seq_len]
+        else:
+            abs_idx = start + token_indices
+            rope_cache = rope2d_freqs_grid[key].index_select(dim=4, index=abs_idx)
+
+        # Precomputed cache is stored for the original BHLc path as
+        # [2, 1, 1, 1, L, half_dim]. After normalizing q/k to BLHc we need the
+        # sequence axis to broadcast onto the L dimension, not the head axis.
+        rope_cache = rope_cache.squeeze(1).squeeze(1).unsqueeze(3)  # [2, 1, L, 1, half_dim]
+
+        qk = qk.reshape(*qk.shape[:-1], -1, 2)  # (2, B, L, H, half_head_dim, 2)
         qk = torch.stack([
-            rope_cache[0] * qk[...,0] - rope_cache[1] * qk[...,1],
-            rope_cache[1] * qk[...,0] + rope_cache[0] * qk[...,1],
-        ], dim=-1) # (2, batch_size, heads, seq_len, half_head_dim, 2), here stack + reshape should not be concate
-        qk = qk.reshape(*qk.shape[:-2], -1) #(2, batch_size, heads, seq_len, head_dim)
-        q, k = qk.unbind(dim=0) # (batch_size, heads, seq_len, head_dim)
+            rope_cache[0] * qk[..., 0] - rope_cache[1] * qk[..., 1],
+            rope_cache[1] * qk[..., 0] + rope_cache[0] * qk[..., 1],
+        ], dim=-1)
+        qk = qk.reshape(*qk.shape[:-2], -1)  # (2, B, L, H, head_dim)
+        q, k = qk.unbind(dim=0)
+
+    if transposed:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
     return q, k
 
 
@@ -387,7 +444,7 @@ class SelfAttention(nn.Module):
         self.cached_v = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
+    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, token_indices=None):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
         :param (fp32) attn_bias_or_two_vector:
@@ -430,7 +487,17 @@ class SelfAttention(nn.Module):
             k = k.contiguous()      # bf16
             v = v.contiguous()      # bf16
         if rope2d_freqs_grid is not None:
-            q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
+            q, k = apply_rotary_emb(
+                q,
+                k,
+                scale_schedule,
+                rope2d_freqs_grid,
+                self.pad_to_multiplier,
+                self.rope2d_normalized_by_hw,
+                scale_ind,
+                token_indices=token_indices,
+                qkv_layout="BLHc" if self.using_flash else "BHLc",
+            ) #, freqs_cis=freqs_cis)
         if self.caching:    # kv caching: only used during inference
             if self.cached_k is None: self.cached_k = k; self.cached_v = v
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
@@ -633,7 +700,7 @@ class CrossAttnBlock(nn.Module):
         self.checkpointing_sa_only = checkpointing_sa_only
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, token_indices=None):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
         with torch.amp.autocast('cuda', enabled=False):    # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
@@ -643,18 +710,46 @@ class CrossAttnBlock(nn.Module):
         if self.fused_norm_func is None:
             x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1)
             if self.checkpointing_sa_only and self.training:
-                x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
+                x_sa = checkpoint(
+                    self.sa,
+                    x_sa,
+                    attn_bias_or_two_vector,
+                    attn_fn,
+                    scale_schedule,
+                    rope2d_freqs_grid,
+                    scale_ind,
+                    token_indices,
+                    use_reentrant=False,
+                )
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
+                x_sa = self.sa(
+                    x_sa,
+                    attn_bias_or_two_vector,
+                    attn_fn,
+                    scale_schedule,
+                    rope2d_freqs_grid,
+                    scale_ind=scale_ind,
+                    token_indices=token_indices,
+                )
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         else:
             x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
             if self.checkpointing_sa_only and self.training:
-                x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
+                x_sa = checkpoint(
+                    self.sa,
+                    x_sa,
+                    attn_bias_or_two_vector,
+                    attn_fn,
+                    scale_schedule,
+                    rope2d_freqs_grid,
+                    scale_ind,
+                    token_indices,
+                    use_reentrant=False,
+                )
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
+                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, token_indices=token_indices)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP

@@ -12,6 +12,9 @@ from functools import partial
 from distutils.util import strtobool
 from typing import List, Optional, Tuple
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.append(_THIS_DIR)
 
 import numpy as np
 import torch
@@ -60,10 +63,10 @@ def build_everything_from_args(args: arg_util.Args, saver):
         vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
 
     # build models. Note that here gpt is the causal VAR transformer which performs next scale prediciton with text guidance
-    text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim, student_wo_ddp, student_ddp, student_optim = build_model_optimizer(args, vae_ckpt)
+    text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim,         student_wo_ddp, student_ddp, student_optim, same_scale_refiner_wo_ddp, same_scale_refiner_ddp, same_scale_refiner_optim = build_model_optimizer(args, vae_ckpt)
     
     # IMPORTANT: import heavy package `InfinityTrainer` after the Dataloader object creation/iteration to avoid OOM
-    from trainer_stage2_var_entropy import InfinityTrainer
+    from trainer_stage2_var_entropy_patched import InfinityTrainer
     # build trainer
     trainer = InfinityTrainer(
         is_visualizer=dist.is_visualizer(), device=args.device, raw_scale_schedule=args.scale_schedule, resos=args.resos,
@@ -71,7 +74,8 @@ def build_everything_from_args(args: arg_util.Args, saver):
         gpt_opt=gpt_optim, label_smooth=args.ls, z_loss_ratio=args.lz, eq_loss=args.eq, xen=args.xen,
         dbg_unused=args.dbg, zero=args.zero, vae_type=args.vae_type,
         reweight_loss_by_scale=args.reweight_loss_by_scale, gpt_wo_ddp_ema=gpt_wo_ddp_ema, 
-        gpt_ema=gpt_ddp_ema, use_fsdp_model_ema=args.use_fsdp_model_ema, student_wo_ddp=student_wo_ddp, student=student_ddp, student_opt=student_optim, other_args=args,
+        gpt_ema=gpt_ddp_ema, use_fsdp_model_ema=args.use_fsdp_model_ema, student_wo_ddp=student_wo_ddp, student=student_ddp, student_opt=student_optim,
+        same_scale_refiner_wo_ddp=same_scale_refiner_wo_ddp, same_scale_refiner=same_scale_refiner_ddp, same_scale_refiner_opt=same_scale_refiner_optim, other_args=args,
     )
     
     # auto resume from broken experiment
@@ -89,7 +93,7 @@ def build_everything_from_args(args: arg_util.Args, saver):
     start_it = start_it % iters_train
     print(f"{start_it=}, {iters_train=}")
     
-    del vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim, student_wo_ddp, student_ddp, student_optim
+    del vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim, student_wo_ddp, student_ddp, student_optim, same_scale_refiner_wo_ddp, same_scale_refiner_ddp, same_scale_refiner_optim
     dist.barrier()
     return (
         text_tokenizer, text_encoder, trainer,
@@ -102,12 +106,14 @@ def build_model_optimizer(args, vae_ckpt):
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from infinity.models.infinity import Infinity, MultipleLayers
     from infinity.models.init_param import init_weights
+    from infinity.models.condition_codec import BoundaryConditionCodec, BoundarySpatialAdapter
+    from infinity.models.same_scale_refiner import SameScaleRefinementHead
     from infinity.utils.amp_opt import AmpOptimizer
     from infinity.utils.lr_control import filter_params
     from infinity.utils.load import build_vae_gpt
     
     # Disable default init only while constructing VAE/GPT. New modules created later
-    # (for example student heads) still need normal initialization.
+    # (for example refiner/student heads) still need normal initialization.
     linear_reset_parameters = torch.nn.Linear.reset_parameters
     layernorm_reset_parameters = torch.nn.LayerNorm.reset_parameters
     try:
@@ -156,6 +162,76 @@ def build_model_optimizer(args, vae_ckpt):
         if hasattr(gpt_wo_ddp.word_embed, 'bias'):
             gpt_wo_ddp.word_embed.bias.requires_grad = False
             gpt_wo_ddp.word_embed.bias.data.zero_()
+
+    def _infer_condition_adapter_max_scales(model):
+        configured = int(getattr(args, 'condition_adapter_max_scales', 0) or 0)
+        if configured > 0:
+            return configured
+        counts = []
+        train_h_div_w_list = getattr(args, 'train_h_div_w_list', None) or [1.0]
+        templates = np.array(list(dynamic_resolution_h_w.keys()), dtype=float)
+        for h_div_w in train_h_div_w_list:
+            try:
+                h_div_w_template = float(templates[np.argmin(np.abs(float(h_div_w) - templates))])
+                scales = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
+                counts.append(len(scales))
+            except Exception:
+                pass
+        for schedule in (getattr(args, 'scale_schedule', None), getattr(model, 'raw_scale_schedule', None)):
+            if schedule is not None:
+                try:
+                    counts.append(len(schedule))
+                except TypeError:
+                    pass
+        return max(counts) if counts else 16
+
+    def _attach_boundary_conditioning(model):
+        if model is None:
+            return
+        condition_codec_type = str(getattr(args, 'condition_codec_type', 'binary') or 'binary').lower()
+        condition_adapter_init = str(getattr(args, 'condition_adapter_init', 'shared') or 'shared').lower().replace('-', '_')
+        condition_adapter_max_scales = _infer_condition_adapter_max_scales(model)
+        if condition_codec_type == 'vae_token':
+            model.condition_codec = None
+            condition_feature_dim = int(getattr(vae_local, 'codebook_dim', getattr(vae_local, 'Cvae', args.boundary_cond_feature_dim)))
+        else:
+            condition_feature_dim = int(getattr(args, 'boundary_cond_feature_dim', 32))
+            model.condition_codec = BoundaryConditionCodec(
+                input_size=int(getattr(args, 'boundary_cond_size', 128)),
+                hidden_dim=int(getattr(args, 'boundary_cond_hidden_dim', 48)),
+                latent_dim=int(getattr(args, 'boundary_cond_latent_dim', 12)),
+                feature_dim=condition_feature_dim,
+            ).to(args.device)
+        model.condition_adapter = BoundarySpatialAdapter(
+            feature_dim=condition_feature_dim,
+            embed_dim=getattr(model, 'C'),
+            depth=getattr(model, 'depth'),
+            adapter_init=condition_adapter_init,
+            max_scales=condition_adapter_max_scales,
+        ).to(args.device)
+
+    if getattr(args, 'enable_boundary_condition', 0):
+        _attach_boundary_conditioning(gpt_wo_ddp)
+        _attach_boundary_conditioning(gpt_wo_ddp_ema)
+        if gpt_wo_ddp_ema is not None:
+            if getattr(gpt_wo_ddp, 'condition_codec', None) is not None:
+                gpt_wo_ddp_ema.condition_codec.load_state_dict(gpt_wo_ddp.condition_codec.state_dict())
+            gpt_wo_ddp_ema.condition_adapter.load_state_dict(gpt_wo_ddp.condition_adapter.state_dict())
+            if getattr(gpt_wo_ddp_ema, 'condition_codec', None) is not None:
+                for p in gpt_wo_ddp_ema.condition_codec.parameters():
+                    p.requires_grad_(False)
+            for p in gpt_wo_ddp_ema.condition_adapter.parameters():
+                p.requires_grad_(False)
+        if getattr(args, 'enable_same_scale_refiner', 0):
+            print('[boundary_condition] enabled; disabling same-scale refiner for a clean adapter-only experiment.')
+            args.enable_same_scale_refiner = 0
+        print(
+            f"[spatial_condition] type={getattr(args, 'spatial_cond_type', 'boundary')}, "
+            f"codec={getattr(args, 'condition_codec_type', 'binary')}, size={args.boundary_cond_size}, "
+            f"latent_dim={args.boundary_cond_latent_dim}, feature_dim={gpt_wo_ddp.condition_adapter.feature_dim}, "
+            f"adapter_init={gpt_wo_ddp.condition_adapter.adapter_init}, "
+            f"adapter_max_scales={gpt_wo_ddp.condition_adapter.max_scales}"
+        )
     ndim_dict = {name: para.ndim for name, para in gpt_wo_ddp.named_parameters() if para.requires_grad}
     
     print(f'[PT] GPT model = {gpt_wo_ddp}\n\n')
@@ -169,6 +245,16 @@ def build_model_optimizer(args, vae_ckpt):
     
     gpt_uncompiled = gpt_wo_ddp
     gpt_wo_ddp = args.compile_model(gpt_wo_ddp, args.tfast)
+
+    def _attach_same_scale_refiner(model, refiner):
+        if model is None or refiner is None:
+            return
+        try:
+            model.same_scale_refiner = refiner
+        except Exception:
+            pass
+        if hasattr(model, '_orig_mod'):
+            model._orig_mod.same_scale_refiner = refiner
 
     gpt_ddp_ema = None
     if args.zero:
@@ -232,11 +318,51 @@ def build_model_optimizer(args, vae_ckpt):
             'ada_gss', 'moe_bias',
             'scale_mul',
             'text_proj_for_sos.ca.mat_q',
+            'prior_logits',
         }
     if args.nowd >= 2:
         nowd_keys |= {'class_emb', 'embedding'}
-    names, paras, para_groups = filter_params(gpt_ddp if args.zero else gpt_wo_ddp, ndim_dict, nowd_keys=nowd_keys)
+    optim_model = gpt_ddp if args.zero else gpt_wo_ddp
+    names, paras, para_groups = filter_params(optim_model, ndim_dict, nowd_keys=nowd_keys)
     del ndim_dict
+
+    condition_lr = float(getattr(args, 'condition_lr', 0.0) or 0.0)
+    if condition_lr > 0:
+        if float(args.tlr) <= 0:
+            raise ValueError(f'condition_lr requires args.tlr > 0, got {args.tlr}')
+        cond_param_ids = {
+            id(p) for n, p in optim_model.named_parameters()
+            if p.requires_grad and ('condition_codec' in n or 'condition_adapter' in n)
+        }
+        if len(cond_param_ids) == 0:
+            print(f'[spatial_condition] condition_lr={condition_lr:g} requested but no condition params were found.')
+        else:
+            cond_lr_sc = condition_lr / float(args.tlr)
+            split_groups = []
+            cond_numel = 0
+            for group in para_groups:
+                base_params, cond_params = [], []
+                for p in group['params']:
+                    if id(p) in cond_param_ids:
+                        cond_params.append(p)
+                        cond_numel += p.numel()
+                    else:
+                        base_params.append(p)
+                if base_params:
+                    base_group = dict(group)
+                    base_group['params'] = base_params
+                    split_groups.append(base_group)
+                if cond_params:
+                    cond_group = dict(group)
+                    cond_group['params'] = cond_params
+                    cond_group['lr_sc'] = cond_lr_sc
+                    cond_group['group_name'] = 'spatial_condition'
+                    split_groups.append(cond_group)
+            para_groups = split_groups
+            print(
+                f'[spatial_condition] separate lr enabled: var_lr={float(args.tlr):g}, '
+                f'condition_lr={condition_lr:g}, lr_sc={cond_lr_sc:g}, condition_params={cond_numel}'
+            )
     if '_' in args.ada:
         beta0, beta1 = map(float, args.ada.split('_'))
     else:
@@ -307,8 +433,58 @@ def build_model_optimizer(args, vae_ckpt):
             student_ddp = ddp_class(student_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
             student_optim = torch.optim.AdamW(student_wo_ddp.parameters(), lr=args.student_lr, weight_decay=args.student_wd)
             print(f'[student] enabled, hidden={args.student_hidden_dim}, depth={args.student_depth}, lr={args.student_lr}, start_step={args.student_start_step}')
+
+    same_scale_refiner_wo_ddp = same_scale_refiner_ddp = same_scale_refiner_optim = None
+    if getattr(args, 'enable_same_scale_refiner', 1):
+        if not args.use_bit_label:
+            raise NotImplementedError('Same-scale refinement currently requires args.use_bit_label=1.')
+        refiner_scale_schedule = getattr(args, 'scale_schedule', None)
+        if refiner_scale_schedule is None:
+            refiner_scale_schedule = getattr(gpt_wo_ddp, 'raw_scale_schedule', None)
+        refiner_num_scales = len(refiner_scale_schedule) if refiner_scale_schedule is not None else 16
+        refiner_hidden_dim = int(getattr(args, 'same_scale_refiner_hidden_dim', 64))
+        refiner_depth = int(getattr(args, 'same_scale_refiner_depth', 2))
+        refiner_dropout = float(getattr(args, 'same_scale_refiner_dropout', 0.0))
+        same_scale_refiner_wo_ddp = SameScaleRefinementHead(
+            codebook_dim=gpt_wo_ddp.V // 2,
+            text_dim=args.Ct5,
+            hidden_state_dim=getattr(gpt_wo_ddp, 'C', 0),
+            hidden_dim=refiner_hidden_dim,
+            depth=refiner_depth,
+            max_scales=max(32, refiner_num_scales + 4),
+            dropout=refiner_dropout,
+            neighborhood_kernel=int(getattr(args, 'same_scale_refiner_kernel', 3)),
+            max_delta=float(getattr(args, 'same_scale_calibrator_max_delta', 4.0)),
+            gate_bias_init=float(getattr(args, 'same_scale_gate_bias_init', -2.0)),
+        ).to(args.device)
+        _attach_same_scale_refiner(gpt_uncompiled, same_scale_refiner_wo_ddp)
+        _attach_same_scale_refiner(gpt_wo_ddp, same_scale_refiner_wo_ddp)
+        _attach_same_scale_refiner(gpt_wo_ddp_ema, same_scale_refiner_wo_ddp)
+        refiner_lr = float(getattr(args, 'same_scale_refiner_lr', args.tlr))
+        if refiner_lr <= 0:
+            refiner_lr = args.tlr
+        refiner_wd = float(getattr(args, 'same_scale_refiner_wd', 0.0))
+        if args.zero:
+            same_scale_refiner_ddp = FSDP(
+                same_scale_refiner_wo_ddp,
+                device_id=dist.get_local_rank(),
+                sharding_strategy=sharding_strategy,
+                mixed_precision=None,
+                auto_wrap_policy=None,
+                use_orig_params=True,
+                sync_module_states=True,
+                limit_all_gathers=True,
+                device_mesh=device_mesh,
+            ).to(args.device)
+            same_scale_refiner_optim = torch.optim.AdamW(same_scale_refiner_ddp.parameters(), lr=refiner_lr, weight_decay=refiner_wd)
+            print(f'[same_scale_refiner] enabled with FSDP, hidden={refiner_hidden_dim}, depth={refiner_depth}, lr={refiner_lr}')
+        else:
+            ddp_class = DDP if dist.initialized() else misc.NullDDP
+            same_scale_refiner_ddp = ddp_class(same_scale_refiner_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
+            same_scale_refiner_optim = torch.optim.AdamW(same_scale_refiner_wo_ddp.parameters(), lr=refiner_lr, weight_decay=refiner_wd)
+            print(f'[same_scale_refiner] enabled, hidden={refiner_hidden_dim}, depth={refiner_depth}, lr={refiner_lr}')
     
-    return text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim, student_wo_ddp, student_ddp, student_optim
+    return text_tokenizer, text_encoder, vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim, student_wo_ddp, student_ddp, student_optim, same_scale_refiner_wo_ddp, same_scale_refiner_ddp, same_scale_refiner_optim
 
 
 def build_dataloaders(args):
@@ -325,6 +501,8 @@ def build_dataloaders(args):
             seed=0 if args.seed is None else int(args.seed),
             prefetch_factor=args.prefetch_factor,
             memmap_cache_size=getattr(args, 'proc_memmap_cache_size', 1),
+            condition_path_key=getattr(args, 'condition_path_key', ''),
+            condition_root=getattr(args, 'condition_root', ''),
             distributed=dist.initialized(),
             drop_last=True,
         )
@@ -369,10 +547,12 @@ def main_train(args: arg_util.Args):
         start_ep, start_it, acc_str, eval_milestone,
         iters_train, ld_train, ld_val
     ) = ret
-    gc.collect(), torch.cuda.empty_cache()
+    gc.collect()
+    if getattr(args, 'release_cuda_cache_after_init', 0):
+        torch.cuda.empty_cache()
     
     # import heavy packages after Dataloader object creation
-    from trainer_stage2_var_entropy import InfinityTrainer
+    from trainer_stage2_var_entropy_patched import InfinityTrainer
     ret: Tuple[
         misc.TensorboardLogger, T5TokenizerFast, T5EncoderModel, InfinityTrainer,
         int, int, str, List[Tuple[float, float]], Optional[int], Optional[DataLoader], DataLoader,
@@ -402,7 +582,11 @@ def main_train(args: arg_util.Args):
     PARA_ALL = PARA_EMB + PARA_ALN + PARA_OT
     
     trainer.gpt_opt.log_param(ep=-1)
-    time.sleep(3), gc.collect(), torch.cuda.empty_cache(), time.sleep(3)
+    time.sleep(3)
+    gc.collect()
+    if getattr(args, 'release_cuda_cache_after_init', 0):
+        torch.cuda.empty_cache()
+    time.sleep(3)
     ep_lg = max(1, args.ep // 10) if args.ep <= 100 else max(1, args.ep // 20)
     
     # ============================================= epoch loop begins =============================================
@@ -517,7 +701,7 @@ def train_one_ep(
     text_tokenizer: T5TokenizerFast, text_encoder: T5EncoderModel, trainer, logging_params_milestone, enable_timeline_sdk: bool,
 ):
     # IMPORTANT: import heavy packages after the Dataloader object creation/iteration to avoid OOM
-    from trainer_stage2_var_entropy import InfinityTrainer
+    from trainer_stage2_var_entropy_patched import InfinityTrainer
     from infinity.utils.lr_control import lr_wd_annealing
     trainer: InfinityTrainer
     
@@ -541,12 +725,13 @@ def train_one_ep(
         PRINTABLE_IT_PLUS_1 = set(FREQ*i for i in ranges)
 
         me = misc.MetricLogger()
-        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{value:.2g}')) for x in ['tlr']]
+        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{value:.2g}')) for x in ['tlr', 'vlr', 'clr']]
         [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.2f} ({global_avg:.2f})')) for x in ['tnm']]
         [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lm', 'Lt']]
         [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.2f} ({global_avg:.2f})')) for x in ['Accm', 'Acct']]
-        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Stu']]
-        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.2f} ({global_avg:.2f})')) for x in ['StuGD']]
+        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Stu', 'Cal', 'Safe', 'Reg']]
+        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.4f} ({global_avg:.4f})')) for x in ['BCR', 'BCRec', 'BCBpp']]
+        [me.add_meter(x, misc.SmoothedValue(window_size=1, fmt='{median:.2f} ({global_avg:.2f})')) for x in ['StuGD', 'RefGD']]
         # ============================================= iteration loop begins =============================================
         for it, data in me.log_every(start_it, iters_train, ld_or_itrt, args.log_freq, args.log_every_iter, header):
             g_it = ep * iters_train + it
@@ -569,8 +754,13 @@ def train_one_ep(
             with maybe_record_function('before_train'):
                 # [get data]
                 dataset_backend = getattr(args, 'dataset_backend', 'streaming')
+                condition_B1HW = None
                 if dataset_backend in {'proc', 'proc_memmap', 'memmap'}:
-                    inp, text_cond_tuple = data
+                    if len(data) == 3:
+                        inp, text_cond_tuple, condition_B1HW = data
+                        condition_B1HW = condition_B1HW.to(args.device, non_blocking=True)
+                    else:
+                        inp, text_cond_tuple = data
                     inp = inp.to(args.device, non_blocking=True)
                     text_cond_tuple = move_text_cond_tuple_to_device(text_cond_tuple, device=torch.device(args.device), kv_dtype=torch.float32)
                 else:
@@ -604,6 +794,14 @@ def train_one_ep(
                 # [schedule learning rate]
                 wp_it = args.wp * iters_train
                 min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.gpt_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
+                var_lr = max(
+                    (pg['lr'] for pg in trainer.gpt_opt.optimizer.param_groups if pg.get('group_name') != 'spatial_condition'),
+                    default=max_tlr,
+                )
+                cond_lr = max(
+                    (pg['lr'] for pg in trainer.gpt_opt.optimizer.param_groups if pg.get('group_name') == 'spatial_condition'),
+                    default=0.0,
+                )
                 
                 # [get scheduled hyperparameters]
                 progress = g_it / (max_it - 1)
@@ -619,11 +817,20 @@ def train_one_ep(
                     logging_params=stepping and step_cnt == 1 and (ep < 4 or ep in logging_params_milestone), 
                     inp_B3HW=inp, 
                     text_cond_tuple=text_cond_tuple,
+                    condition_B1HW=condition_B1HW,
                     args=args,
                 )
+                mem_log_freq = int(getattr(args, 'cuda_mem_log_freq', 0) or 0)
+                if mem_log_freq > 0 and torch.cuda.is_available() and (g_it + 1) % mem_log_freq == 0 and dist.is_local_master():
+                    dev = torch.cuda.current_device()
+                    alloc = torch.cuda.memory_allocated(dev) / (1024 ** 3)
+                    reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
+                    max_alloc = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
+                    max_reserved = torch.cuda.max_memory_reserved(dev) / (1024 ** 3)
+                    print(f'[cuda_mem] g_it={g_it+1} alloc={alloc:.2f}GiB reserved={reserved:.2f}GiB max_alloc={max_alloc:.2f}GiB max_reserved={max_reserved:.2f}GiB', flush=True)
             
             with maybe_record_function('after_train'):
-                me.update(tlr=max_tlr)
+                me.update(tlr=max_tlr, vlr=var_lr, clr=cond_lr)
     # ============================================= iteration loop ends =============================================
     
     me.synchronize_between_processes()

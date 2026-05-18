@@ -28,6 +28,8 @@ Available strategies:
 - `entropy_channel` : keep top bit-channels (bit-planes) by entropy
 - `entropy_scale` : derive per-scale keep ratio from mean entropy, then do channel masking
 - `entropy_spatial` : keep top spatial positions by entropy (transmit all active bits there)
+- `rdproxy_spatial` : keep positions by a rate-distortion proxy score
+- `stepvar_spatial` : StepVAR-style structure-texture guided pruning approximation with optional previous-scale nearest fill
 
 ## 2. CLI
 

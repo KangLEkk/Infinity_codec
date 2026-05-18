@@ -214,7 +214,14 @@ class InfinityTrainer(object):
             # x_BLC_wo_prefix: torch.Size([bs, 2*2+3*3+...+64*64, d or 4d])
 
             # truncate scales
-            training_scales = args.always_training_scales
+            available_scales = min(len(scale_schedule), len(vae_scale_schedule), len(gt_ms_idx_Bl))
+            training_scales = min(int(args.always_training_scales), available_scales)
+            if training_scales <= 0:
+                raise ValueError(
+                    f'No valid training scales: always_training_scales={args.always_training_scales}, '
+                    f'len(scale_schedule)={len(scale_schedule)}, len(vae_scale_schedule)={len(vae_scale_schedule)}, '
+                    f'len(gt_ms_idx_Bl)={len(gt_ms_idx_Bl)}'
+                )
             training_seq_len = np.array(scale_schedule)[:training_scales].prod(axis=1).sum()
             x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 

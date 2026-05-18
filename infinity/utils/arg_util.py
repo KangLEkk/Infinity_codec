@@ -37,6 +37,56 @@ class Args(Tap):
     student_start_scale: int = 1
     student_kd_ratio: float = 1.0
     student_gt_ratio: float = 1.0
+
+    # same-scale learned probability calibrator
+    enable_same_scale_refiner: int = 1
+    same_scale_start_step: int = 0
+    same_scale_refiner_hidden_dim: int = 64
+    same_scale_refiner_depth: int = 2
+    same_scale_refiner_dropout: float = 0.0
+    same_scale_refiner_kernel: int = 3
+    same_scale_refiner_lr: float = 0.0      # 0 means reuse training lr
+    same_scale_refiner_wd: float = 0.0
+    same_scale_refiner_grad_clip: float = 1.0
+    same_scale_refine_ratio: float = 1.0
+    same_scale_safety_ratio: float = 0.2
+    same_scale_reg_ratio: float = 0.01
+    same_scale_safety_margin: float = 0.0
+    same_scale_refine_alpha: float = 1.0
+    same_scale_detach_firstpass_input: int = 1
+    same_scale_calibrator_max_delta: float = 4.0
+    same_scale_gate_bias_init: float = -2.0
+
+    # boundary side-condition codec + ControlNet-style adapters
+    enable_boundary_condition: int = 0
+    spatial_cond_type: str = 'boundary'     # boundary | depth; depth is a low-rate layout/depth proxy
+    condition_codec_type: str = 'binary'    # binary | vae_token
+    condition_token_scales: int = 2         # for vae_token: 2 => 1x1+2x2 coarse LFQ/BSQ tokens
+    condition_token_scales_min: int = 0     # 0 => fixed; >0 randomly train in [min, condition_token_scales]
+    condition_adapter_init: str = 'shared'  # shared | per_scale_zero
+    condition_adapter_max_scales: int = 0   # 0 => infer from dynamic resolution schedule
+    condition_path_key: str = ''            # optional jsonl key for precomputed depth/condition png
+    condition_root: str = ''                # optional root for relative condition paths
+    depth_condition_source: str = 'proxy'   # proxy | transformers
+    depth_model_name: str = 'depth-anything/Depth-Anything-V2-Small-hf'
+    depth_model_dtype: str = 'fp16'
+    depth_model_device: str = ''            # empty => training device
+    depth_model_cache_dir: str = ''
+    seg_condition_source: str = 'transformers'  # transformers
+    seg_model_name: str = 'facebook/sam-vit-base'
+    seg_model_dtype: str = 'fp32'
+    seg_model_device: str = ''              # empty => training device
+    seg_model_cache_dir: str = ''
+    seg_max_masks: int = 16
+    seg_points_per_batch: int = 32
+    seg_output_mode: str = 'region_boundary' # region | boundary | region_boundary
+    boundary_cond_size: int = 128
+    boundary_cond_hidden_dim: int = 48
+    boundary_cond_latent_dim: int = 12
+    boundary_cond_feature_dim: int = 32
+    boundary_cond_rate_ratio: float = 1.0
+    boundary_cond_recon_ratio: float = 0.1
+    condition_lr: float = 0.0               # 0 means reuse VAR lr; otherwise lr for condition codec+adapter
     bed: str = ''                       # bed directory for copy checkpoints apart from local_out_path
     vae_ckpt: str = ''                  # VAE ckpt
     # --- ARPC optional knobs (GM-BMSRQ / SRD) ---
@@ -186,6 +236,8 @@ class Args(Tap):
     apply_spatial_patchify: int = 0     # apply apply_spatial_patchify or not
     debug_bsc: int = 0                  # save figs and set breakpoint for debug bsc and check input
     task_type: str = 't2i'              # take type to t2i or t2v
+    release_cuda_cache_after_init: int = 0  # 1 restores the old pre-train empty_cache behavior
+    cuda_mem_log_freq: int = 0          # >0 prints allocated/reserved CUDA memory every N global steps
 
 
     ############################  Attention! The following arguments and configurations are set automatically, you can skip reading the following part ###############################

@@ -19,7 +19,7 @@ import numpy as np
 
 import infinity.utils.dist as dist
 from infinity.utils.dist import for_visualize
-from infinity.models.basic import flash_attn_func, flash_fused_op_installed, AdaLNBeforeHead, CrossAttnBlock, SelfAttnBlock, CrossAttention, FastRMSNorm, precompute_rope2d_freqs_grid
+from infinity.models.basic_stepvar_sparse import flash_attn_func, flash_fused_op_installed, AdaLNBeforeHead, CrossAttnBlock, SelfAttnBlock, CrossAttention, FastRMSNorm, precompute_rope2d_freqs_grid
 from infinity.utils import misc
 from infinity.models.flex_attn import FlexAttn
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
@@ -58,23 +58,17 @@ class SharedAdaLin(nn.Linear):
 class MultipleLayers(nn.Module):
     def __init__(self, ls, num_blocks_in_a_chunk, index):
         super().__init__()
-        self.index = int(index)
         self.module = nn.ModuleList()
         for i in range(index, index+num_blocks_in_a_chunk):
             self.module.append(ls[i])
 
-    def forward(
-        self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None,
-        checkpointing_full_block=False, rope2d_freqs_grid=None, condition_adapter=None, condition_tokens=None,
-    ):
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None, scale_ind=0, token_indices=None):
         h = x
-        for local_idx, m in enumerate(self.module):
-            if condition_adapter is not None and condition_tokens is not None:
-                h = h + condition_adapter(condition_tokens, self.index + local_idx, dtype=h.dtype, scale_schedule=scale_schedule)
+        for m in self.module:
             if checkpointing_full_block:
-                h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
+                h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind, token_indices, use_reentrant=False)
             else:
-                h = m(h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
+                h = m(h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, token_indices=token_indices)
         return h
 
 class Infinity(nn.Module):
@@ -348,19 +342,16 @@ class Infinity(nn.Module):
         with torch.amp.autocast('cuda', enabled=False):
             return self.head(self.head_nm(h.float(), cond_BD.float()))
 
-    def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0):
+    def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0, token_indices=None):
         bs, seq_len, c = feature.shape
         patch_t, patch_h, patch_w = scale_schedule[scale_ind]
         t_mul_h_mul_w = patch_t * patch_h * patch_w
-        assert t_mul_h_mul_w + need_to_pad == seq_len
-        if not (0 <= int(scale_ind) < self.lvl_embed.num_embeddings):
-            raise IndexError(
-                f"scale_ind={scale_ind} is out of range for lvl_embed with "
-                f"num_embeddings={self.lvl_embed.num_embeddings}; "
-                f"len(scale_schedule)={len(scale_schedule)}"
-            )
-        lvl_idx = torch.full((bs, t_mul_h_mul_w), int(scale_ind), dtype=torch.long, device=feature.device)
-        feature[:, :t_mul_h_mul_w] += self.lvl_embed(lvl_idx)
+        valid_len = seq_len - need_to_pad
+        if token_indices is None:
+            assert t_mul_h_mul_w + need_to_pad == seq_len
+        else:
+            assert valid_len == int(token_indices.numel()), f"sparse token len mismatch: {valid_len} vs {int(token_indices.numel())}"
+        feature[:, :valid_len] += self.lvl_embed(scale_ind * torch.ones((bs, valid_len), dtype=torch.int, device=feature.device))
         return feature
     
     def add_lvl_embeding_for_x_BLC(self, x_BLC, scale_schedule, need_to_pad=0):
@@ -377,12 +368,100 @@ class Infinity(nn.Module):
         x_BLC = torch.cat(x_BLC_list, dim=1)
         return x_BLC
 
+    def _stepvar_resolve_prune_ratio(self, stepvar_prune_ratios, si, num_scales):
+        if stepvar_prune_ratios is None:
+            return 0.0
+        if isinstance(stepvar_prune_ratios, dict):
+            ratio = stepvar_prune_ratios.get(si, stepvar_prune_ratios.get(str(si), 0.0))
+            return float(max(0.0, min(1.0, ratio)))
+        if isinstance(stepvar_prune_ratios, (list, tuple, np.ndarray)):
+            if len(stepvar_prune_ratios) == 0:
+                return 0.0
+            if len(stepvar_prune_ratios) == 1:
+                return float(max(0.0, min(1.0, stepvar_prune_ratios[0])))
+            if len(stepvar_prune_ratios) == num_scales:
+                return float(max(0.0, min(1.0, stepvar_prune_ratios[si])))
+            tail_offset = num_scales - len(stepvar_prune_ratios)
+            if si >= tail_offset:
+                return float(max(0.0, min(1.0, stepvar_prune_ratios[si - tail_offset])))
+            return 0.0
+        return float(max(0.0, min(1.0, stepvar_prune_ratios)))
+
+    def _stepvar_structure_texture_score(self, x_BLC: torch.Tensor, pn: Tuple[int], w_str: float = 0.5, power_iter: int = 3):
+        """
+        x_BLC: [B, L, C] dense current-scale features before transformer blocks.
+        Returns token importance scores with HF + PCA fusion.
+        """
+        pt, ph, pw = pn
+        B, L, C = x_BLC.shape
+        X = x_BLC.float().mean(dim=0)  # [L, C]
+        X_centered = X - X.mean(dim=0, keepdim=True)
+
+        # PCA / structure score
+        v = torch.randn(C, 1, device=X.device, dtype=X.dtype)
+        v = F.normalize(v, dim=0)
+        for _ in range(max(1, int(power_iter))):
+            v = X_centered.t().matmul(X_centered.matmul(v))
+            v = F.normalize(v, dim=0)
+        s_str = (X_centered.matmul(v)).abs().squeeze(-1)
+
+        # HF / texture score
+        x_spatial = X.reshape(pt, ph, pw, C).permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, T, H, W]
+        if pt > 1:
+            x_low = F.avg_pool3d(x_spatial, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1))
+        else:
+            x_2d = x_spatial.squeeze(2)
+            x_low = F.avg_pool2d(x_2d, kernel_size=3, stride=1, padding=1).unsqueeze(2)
+        x_high = x_spatial - x_low
+        s_txt = x_high.pow(2).sum(dim=1).reshape(-1)
+
+        s_str = s_str / (s_str.mean().clamp_min(1e-6))
+        s_txt = s_txt / (s_txt.mean().clamp_min(1e-6))
+        return w_str * s_str + s_txt
+
+    def _stepvar_select_keep_indices(self, x_BLC: torch.Tensor, pn: Tuple[int], prune_ratio: float, w_str: float = 0.5, power_iter: int = 3):
+        total = int(np.prod(pn))
+        keep = int(round((1.0 - float(prune_ratio)) * total))
+        keep = max(0, min(total, keep))
+        if keep >= total:
+            return None
+        if keep == 0:
+            return x_BLC.new_empty((0,), dtype=torch.long)
+        scores = self._stepvar_structure_texture_score(x_BLC, pn=pn, w_str=w_str, power_iter=power_iter)
+        keep_idx = torch.topk(scores, k=keep, dim=0, largest=True, sorted=False).indices
+        keep_idx = keep_idx.sort().values
+        return keep_idx
+
+    def _stepvar_build_recover_index(self, keep_idx: torch.Tensor, pn: Tuple[int], chunk_size: int = 4096):
+        pt, ph, pw = pn
+        total = int(np.prod(pn))
+        if keep_idx.numel() == total:
+            return torch.arange(total, device=keep_idx.device, dtype=torch.long)
+
+        all_idx = torch.arange(total, device=keep_idx.device, dtype=torch.long)
+
+        def _coords(idx: torch.Tensor):
+            t = idx // (ph * pw)
+            rem = idx % (ph * pw)
+            y = rem // pw
+            x = rem % pw
+            return torch.stack((t, y, x), dim=-1).float()
+
+        keep_coords = _coords(keep_idx)
+        recover = torch.empty(total, device=keep_idx.device, dtype=torch.long)
+        for start in range(0, total, int(chunk_size)):
+            end = min(total, start + int(chunk_size))
+            q_coords = _coords(all_idx[start:end])
+            # nearest kept token in 3D (t, y, x) space
+            dist_mat = torch.cdist(q_coords, keep_coords)
+            recover[start:end] = dist_mat.argmin(dim=1)
+        return recover
+
+    def _stepvar_recover_dense(self, x_sparse: torch.Tensor, recover_index: torch.Tensor):
+        return x_sparse.index_select(dim=1, index=recover_index)
+
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
         cfg_infer=False,
-        condition_input: Optional[torch.Tensor] = None,
-        condition_features: Optional[torch.Tensor] = None,
-        return_condition_aux: bool = False,
-        condition_image_hw: Optional[Tuple[int, int]] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
         """
@@ -390,14 +469,7 @@ class Infinity(nn.Module):
         :return: logits BLV, V is vocab_size
         """
         if cfg_infer:
-            return self.autoregressive_infer_cfg(
-                label_B_or_BLT=label_B_or_BLT,
-                scale_schedule=scale_schedule,
-                condition_input=condition_input,
-                condition_features=condition_features,
-                condition_image_hw=condition_image_hw,
-                **kwargs,
-            )
+            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
         
         x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         B = x_BLC_wo_prefix.shape[0]
@@ -447,16 +519,6 @@ class Infinity(nn.Module):
                     attn_bias[0, 0, l_end:, 0] = 0
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 attn_bias_or_two_vector = attn_bias.type_as(x_BLC).to(x_BLC.device)
-
-            condition_aux = None
-            condition_tokens = None
-            condition_codec = getattr(self, 'condition_codec', None)
-            condition_adapter = getattr(self, 'condition_adapter', None)
-            if condition_features is not None and condition_adapter is not None:
-                condition_tokens = condition_adapter.make_tokens(condition_features, scale_schedule, need_to_pad=need_to_pad)
-            elif condition_input is not None and condition_codec is not None and condition_adapter is not None:
-                condition_aux = condition_codec(condition_input, image_hw=condition_image_hw)
-                condition_tokens = condition_adapter.make_tokens(condition_aux["features"], scale_schedule, need_to_pad=need_to_pad)
         
         if self.use_flex_attn:
             attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
@@ -472,8 +534,6 @@ class Infinity(nn.Module):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if condition_tokens is not None:
-                    x_BLC = x_BLC + condition_adapter(condition_tokens, i, dtype=x_BLC.dtype, scale_schedule=scale_schedule)
                 if checkpointing_full_block:
                     x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
                 else:
@@ -484,20 +544,10 @@ class Infinity(nn.Module):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                x_BLC = chunk(
-                    x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
-                    attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn,
-                    scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block,
-                    rope2d_freqs_grid=self.rope2d_freqs_grid,
-                    condition_adapter=condition_adapter,
-                    condition_tokens=condition_tokens,
-                )
+                x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=0, token_indices=None)
 
         # [3. unpad the seqlen dim, and then get logits]
-        logits = self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
-        if return_condition_aux:
-            return logits, condition_aux
-        return logits
+        return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
@@ -515,9 +565,13 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
-        condition_input: Optional[torch.Tensor] = None,
-        condition_features: Optional[torch.Tensor] = None,
-        condition_image_hw: Optional[Tuple[int, int]] = None,
+        stepvar_enabled=False,
+        stepvar_prune_ratios=None,
+        stepvar_w_str=0.5,
+        stepvar_power_iter=3,
+        stepvar_chunk_size=4096,
+        stepvar_min_scale=0,
+        stepvar_skip_last_n=0,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -558,16 +612,6 @@ class Infinity(nn.Module):
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
-        condition_codec = getattr(self, 'condition_codec', None)
-        condition_adapter = getattr(self, 'condition_adapter', None)
-        if condition_features is not None and condition_adapter is not None:
-            if bs != B:
-                condition_features = condition_features.repeat(bs // B, 1, 1, 1)
-        elif condition_input is not None and condition_codec is not None and condition_adapter is not None:
-            condition_aux = condition_codec(condition_input, image_hw=condition_image_hw)
-            condition_features = condition_aux["features"]
-            if bs != B:
-                condition_features = condition_features.repeat(bs // B, 1, 1, 1)
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
 
@@ -604,67 +648,68 @@ class Infinity(nn.Module):
             need_to_pad = 0
             attn_fn = None
             if self.use_flex_attn:
-                # need_to_pad = (self.pad_to_multiplier - cur_L % self.pad_to_multiplier) % self.pad_to_multiplier
-                # if need_to_pad:
-                #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
-            condition_scale_tokens = None
-            if condition_features is not None and condition_adapter is not None:
-                condition_scale_tokens = condition_adapter.make_scale_tokens(condition_features, pn, need_to_pad=need_to_pad)
 
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            # ---------- StepVAR sparse current-scale branch ----------
+            stepvar_ratio = 0.0
+            if stepvar_enabled and (si >= int(stepvar_min_scale)):
+                stepvar_ratio = self._stepvar_resolve_prune_ratio(stepvar_prune_ratios, si, len(scale_schedule))
+                if stepvar_skip_last_n and si >= (len(scale_schedule) - int(stepvar_skip_last_n)):
+                    stepvar_ratio = max(stepvar_ratio, 1.0)
+
+            token_indices = None
+            recover_index = None
+            logits_hidden = None
+            skip_transformer_this_scale = False
+            if stepvar_ratio > 0:
+                keep_idx = self._stepvar_select_keep_indices(
+                    last_stage[:B], pn=pn, prune_ratio=stepvar_ratio,
+                    w_str=stepvar_w_str, power_iter=stepvar_power_iter,
+                )
+                if keep_idx is not None:
+                    if keep_idx.numel() == 0:
+                        skip_transformer_this_scale = True
+                        logits_hidden = last_stage
+                    elif keep_idx.numel() < last_stage.shape[1]:
+                        token_indices = keep_idx
+                        recover_index = self._stepvar_build_recover_index(keep_idx, pn=pn, chunk_size=stepvar_chunk_size)
+                        last_stage = last_stage.index_select(dim=1, index=keep_idx)
+
             layer_idx = 0
-            for block_idx, b in enumerate(self.block_chunks):
-                # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
-                if self.add_lvl_embeding_only_first_block and block_idx == 0:
-                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if not self.add_lvl_embeding_only_first_block: 
-                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                
-                for m in b.module:
-                    if condition_scale_tokens is not None:
-                        last_stage = last_stage + condition_adapter(condition_scale_tokens, layer_idx, dtype=last_stage.dtype, scale_id=si)
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
-                    if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
-                        # print(f'add cfg={cfg} on {layer_idx}-th layer output')
-                        last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
-                        last_stage = torch.cat((last_stage, last_stage), 0)
-                    layer_idx += 1
-            
+            if not skip_transformer_this_scale:
+                for block_idx, b in enumerate(self.block_chunks):
+                    if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                        last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad, token_indices=token_indices)
+                    if not self.add_lvl_embeding_only_first_block:
+                        last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad, token_indices=token_indices)
+
+                    for m in b.module:
+                        last_stage = m(
+                            x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None,
+                            attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid,
+                            scale_ind=si, token_indices=token_indices,
+                        )
+                        if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
+                            last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
+                            last_stage = torch.cat((last_stage, last_stage), 0)
+                        layer_idx += 1
+
+                if recover_index is not None:
+                    logits_hidden = self._stepvar_recover_dense(last_stage, recover_index)
+                else:
+                    logits_hidden = last_stage
+            else:
+                logits_hidden = last_stage
+
             if (cfg != 1) and add_cfg_on_logits:
-                # print(f'add cfg on add_cfg_on_logits')
-                logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
+                logits_BlV = self.get_logits(logits_hidden, cond_BD).mul(1/tau_list[si])
                 logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
             else:
-                logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
+                logits_BlV = self.get_logits(logits_hidden[:B], cond_BD[:B]).mul(1/tau_list[si])
             
             if self.use_bit_label:
                 tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
-                pair_logits_BLD2 = logits_BlV.reshape(tmp_bs, tmp_seq_len, -1, 2)
-                refiner = getattr(self, 'same_scale_refiner', None)
-                if refiner is not None:
-                    bit_logits_BLD = _pair_logits_to_single_bit_logits(pair_logits_BLD2)
-                    assert pn[0] == 1, 'same-scale refinement currently assumes pt=1 at inference.'
-                    bit_logits_BDHW = bit_logits_BLD.reshape(tmp_bs, pn[1], pn[2], -1).permute(0, 3, 1, 2).contiguous()
-                    if si == 0:
-                        prefix_feat_BDHW = torch.zeros_like(bit_logits_BDHW)
-                    else:
-                        prefix_feat_BDHW = F.interpolate(summed_codes, size=vae_scale_schedule[si], mode=vae.quantizer.z_interplote_up).contiguous().squeeze(2).float()
-                        if self.apply_spatial_patchify:
-                            prefix_feat_BDHW = torch.nn.functional.pixel_unshuffle(prefix_feat_BDHW, 2)
-                    uncertainty_B1HW = _normalized_uncertainty_from_bit_logits(bit_logits_BDHW)
-                    delta_logits_BDHW = refiner(
-                        prefix_feat_BDHW,
-                        bit_logits_BDHW,
-                        uncertainty=uncertainty_B1HW,
-                        neighbor_context=_neighbor_context_from_bit_logits(bit_logits_BDHW, kernel_size=refiner.neighborhood_kernel),
-                        text_summary=None,
-                        scale_hidden=cond_BD[:B],
-                        scale_id=si,
-                    )
-                    refined_bit_logits_BDHW = bit_logits_BDHW + delta_logits_BDHW
-                    pair_logits_BLD2 = _single_bit_logits_to_pair_logits(refined_bit_logits_BDHW.permute(0, 2, 3, 1).reshape(tmp_bs, tmp_seq_len, -1))
-                logits_BlV = pair_logits_BLD2.reshape(tmp_bs, -1, 2)
+                logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
                 idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
                 idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
             else:
@@ -806,26 +851,6 @@ class Infinity(nn.Module):
     def get_layer_id_and_scale_exp(self, para_name: str):
         raise NotImplementedError
 
-
-
-def _pair_logits_to_single_bit_logits(logits_BLD2: torch.Tensor) -> torch.Tensor:
-    return logits_BLD2[..., 1] - logits_BLD2[..., 0]
-
-
-def _single_bit_logits_to_pair_logits(bit_logits_BLD: torch.Tensor) -> torch.Tensor:
-    return torch.stack((-0.5 * bit_logits_BLD, 0.5 * bit_logits_BLD), dim=-1)
-
-
-def _normalized_uncertainty_from_bit_logits(bit_logits_BDHW: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    probs = torch.sigmoid(bit_logits_BDHW)
-    entropy = -(probs * torch.log(probs.clamp_min(eps)) + (1.0 - probs) * torch.log((1.0 - probs).clamp_min(eps)))
-    entropy = entropy / math.log(2.0)
-    return entropy.mean(dim=1, keepdim=True).clamp_(0.0, 1.0)
-
-
-def _neighbor_context_from_bit_logits(bit_logits_BDHW: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    probs = torch.sigmoid(bit_logits_BDHW)
-    return F.avg_pool2d(probs, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
 
 def sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV: torch.Tensor, top_k: int = 0, top_p: float = 0.0, rng=None, num_samples=1) -> torch.Tensor:  # return idx, shaped (B, l)
     B, l, V = logits_BlV.shape

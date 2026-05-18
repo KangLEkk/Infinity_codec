@@ -1,168 +1,225 @@
-from compression.util import *
-from utils.arithmeticcoding import compress_to_bit_list
-import math
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
-def calc_token_entropy(p_list):
-    ent = 0.0
-    for p in p_list:
-        if 0.0 < p < 1.0:
-            # 二分类信息熵公式: -p*log2(p) - (1-p)*log2(1-p)
-            ent += -p * math.log2(p) - (1 - p) * math.log2(1 - p)
-    return ent
 
-def get_prob(infinity, vae, vae_scale_schedule, prompt, text_tokenizer, text_encoder, gt_ls_Bl, tau_list=0.5, cfg_insertion_layer=[0]):
-    if not isinstance(tau_list, list):
-        tau_list = [tau_list] * len(vae_scale_schedule)
-    label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, prompt)
-    kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
-    bs = B = 1
-    kv_compact = infinity.text_norm(kv_compact)
-    sos = cond_BD = infinity.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) 
-    kv_compact = infinity.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
-    ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-    last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + infinity.pos_start.expand(bs, 1, -1)
-    with torch.amp.autocast('cuda', enabled=False):
-        cond_BD_or_gss = infinity.shared_ada_lin(cond_BD.float()).float().contiguous()
-    for b in infinity.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
-    abs_cfg_insertion_layers = []
-    add_cfg_on_logits, add_cfg_on_probs = False, False
-    leng = len(infinity.unregistered_blocks)
-    for item in cfg_insertion_layer:
-        if item == 0: # add cfg on logits
-            add_cfg_on_logits = True
-        elif item == 1: # add cfg on probs
-            add_cfg_on_probs = True # todo in the future, we may want to add cfg on logits and probs
-        elif item < 0: # determine to add cfg at item-th layer's output
-            assert leng+item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={infinity.num_block_chunks}'
-            abs_cfg_insertion_layers.append(leng+item)
-        else:
-            raise ValueError(f'cfg_insertion_layer: {item} is not valid')
-        
-    num_stages_minus_1 = len(vae_scale_schedule)-1
-    summed_codes = 0
-    cur_L = 0
+from compression.progressive_masked_codec import (
+    FLAG_ARITH,
+    FLAG_RAW,
+    fill_pruned_positions,
+    build_codec_config,
+    build_scale_keep_plan,
+    cleanup_progressive_context,
+    forward_scale_raw_logits,
+    logits_to_prob0,
+    map_bits_from_prob0,
+    precompute_global_spatial_masks,
+    setup_progressive_context,
+    advance_progressive_context,
+)
+from utils.arithmeticcoding import compress_to_bit_list
+
+
+@torch.no_grad()
+def get_prob(
+    infinity,
+    vae,
+    vae_scale_schedule,
+    prompt,
+    text_tokenizer,
+    text_encoder,
+    gt_ls_Bl,
+    tau_list=0.5,
+    cfg_insertion_layer=None,
+):
+    del tau_list
+    if cfg_insertion_layer is None:
+        cfg_insertion_layer = [0]
+
+    ctx = setup_progressive_context(
+        infinity,
+        vae_scale_schedule,
+        prompt,
+        text_tokenizer,
+        text_encoder,
+        cfg_list=1.0,
+        cfg_insertion_layer=cfg_insertion_layer,
+    )
     prob_list = []
-    for si, pn in enumerate(vae_scale_schedule):
-        cur_L += np.array(pn).prod()
-        need_to_pad = 0
-        attn_fn = None
-        if infinity.use_flex_attn:
-            attn_fn = infinity.attn_fn_compile_dict.get(tuple(vae_scale_schedule[:(si+1)]), None)
-        layer_idx = 0
-        for block_idx, b in enumerate(infinity.block_chunks):
-            # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
-            if infinity.add_lvl_embeding_only_first_block and block_idx == 0:
-                last_stage = infinity.add_lvl_embeding(last_stage, si, vae_scale_schedule, need_to_pad=need_to_pad)
-            if not infinity.add_lvl_embeding_only_first_block: 
-                last_stage = infinity.add_lvl_embeding(last_stage, si, vae_scale_schedule, need_to_pad=need_to_pad)
-            
-            for m in b.module:
-                last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=vae_scale_schedule, rope2d_freqs_grid=infinity.rope2d_freqs_grid, scale_ind=si)
-                layer_idx += 1
-        logits_BlV = infinity.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
-    
-        tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
-        logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2) #[bs, vocabulary_size*seq_len, 2]
-        B, l, V = logits_BlV.shape
-        prob = logits_BlV.softmax(dim=-1).view(-1, V)
-        prob_list.append(prob)
-
-        idx_Bld = gt_ls_Bl[si]
-        idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1)
-        idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
-        codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
-        if si != num_stages_minus_1:
-            summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
-            last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
-            last_stage = last_stage.squeeze(-3) # [B, d, h, w] or [B, d, 2h, 2w]
-            last_stage = last_stage.reshape(*last_stage.shape[:2], -1) # [B, d, h*w] or [B, 4d, h*w]
-            last_stage = torch.permute(last_stage, [0,2,1]) # [B, h*w, d] or [B, h*w, 4d]
-        else:
-            summed_codes += codes
-        if si != num_stages_minus_1:
-            last_stage = infinity.word_embed(infinity.norm0_ve(last_stage))
-            last_stage = last_stage.repeat(bs//B, 1, 1)
-    for b in infinity.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
-
+    try:
+        for si in range(len(vae_scale_schedule)):
+            raw_logits = forward_scale_raw_logits(ctx, si)
+            prob0 = logits_to_prob0(raw_logits)
+            prob = torch.stack((prob0, 1.0 - prob0), dim=-1).reshape(-1, 2)
+            prob_list.append(prob)
+            advance_progressive_context(ctx, vae, si, gt_ls_Bl[si].to(device=raw_logits.device, dtype=torch.uint8))
+    finally:
+        cleanup_progressive_context(ctx)
     return prob_list
 
-def encoding(args, infinity, vae, scale_schedule, text, text_tokenizer, text_encoder, gt_ms_idx_Bl):
-    prob_list = get_prob(infinity, vae, scale_schedule, text, text_tokenizer, text_encoder, gt_ms_idx_Bl)
+
+def _encode_token(gt_token: List[int], prob0_token: List[float]) -> Tuple[List[int], int, int]:
+    arith_bits = compress_to_bit_list(gt_token, prob0_token)
+    raw_bits = list(gt_token)
+    if len(arith_bits) < len(raw_bits):
+        return arith_bits, FLAG_ARITH, len(arith_bits)
+    return raw_bits, FLAG_RAW, len(raw_bits)
+
+
+@torch.no_grad()
+def encoding(
+    args,
+    infinity,
+    vae,
+    scale_schedule,
+    text,
+    text_tokenizer,
+    text_encoder,
+    gt_ms_idx_Bl,
+    packet_meta: Optional[Dict[str, Any]] = None,
+    precomputed_prob_list=None,
+):
+    del precomputed_prob_list
+
+    num_scales = len(gt_ms_idx_Bl)
+    d_total = int(gt_ms_idx_Bl[0].shape[-1])
+    codec_cfg = build_codec_config(args, scale_schedule, d_total, num_scales, packet_meta=packet_meta)
+
+    global_kept_pos = None
+    global_stats = None
+    if codec_cfg["mask_strategy"] in ("entropy_spatial_global", "rdproxy_spatial_global"):
+        global_kept_pos, global_stats = precompute_global_spatial_masks(
+            codec_cfg,
+            infinity,
+            vae,
+            scale_schedule,
+            text,
+            text_tokenizer,
+            text_encoder,
+            cfg_list=1.0,
+            cfg_insertion_layer=[getattr(args, "cfg_insertion_layer", 0)],
+        )
+
+    ctx = setup_progressive_context(
+        infinity,
+        scale_schedule,
+        text,
+        text_tokenizer,
+        text_encoder,
+        cfg_list=1.0,
+        cfg_insertion_layer=[getattr(args, "cfg_insertion_layer", 0)],
+    )
+
     trans_list = []
     help_list = []
-    bpp_list = []
+    cumulative_bits = 0
+    cumulative_total_bits = []
+    scale_stats = []
+    prev_bits = None
+    prev_hw = None
 
-    sum_len = 0
-    for i in range(len(gt_ms_idx_Bl)):
-        gt_idx = gt_ms_idx_Bl[i]
-        prob = prob_list[i][:,0]
-        prob = prob.cpu().tolist()
-        gt_idx = gt_idx.view(-1,1).squeeze().cpu().tolist()
-        arithmetic_bits = []
-        hbits = []
-        for j in range(int(len(prob)/args.vae_type)):
-            bits = compress_to_bit_list(gt_idx[j*args.vae_type:(j+1)*args.vae_type], prob[j*args.vae_type:(j+1)*args.vae_type])
-            if len(bits) < args.vae_type:
-                arithmetic_bits.append(bits)
-                hbits.append(1)
-                sum_len += len(bits)
+    try:
+        for si, pn in enumerate(scale_schedule):
+            _, Hs, Ws = pn
+            Hs, Ws = int(Hs), int(Ws)
+            L = int(Hs * Ws)
+            raw_logits = forward_scale_raw_logits(ctx, si)
+            prob0 = logits_to_prob0(raw_logits)
+            d_eff = int(codec_cfg["active_bits"][si])
+            gt_flat = gt_ms_idx_Bl[si].reshape(1, L, d_total).to(device=prob0.device, dtype=torch.uint8)
+            rec_bits = torch.zeros((1, L, d_total), device=prob0.device, dtype=torch.uint8)
+            rec_bits[:, :, :d_eff] = map_bits_from_prob0(prob0[:, :, :d_eff])
+
+            plan = build_scale_keep_plan(
+                codec_cfg=codec_cfg,
+                prob0_BLd=prob0,
+                si=si,
+                Hs=Hs,
+                Ws=Ws,
+                d_total=d_total,
+                vae=vae,
+                device=str(prob0.device),
+                global_kept_pos=(None if global_kept_pos is None or si >= len(global_kept_pos) else global_kept_pos[si]),
+            )
+
+            payloads = []
+            flags = []
+            payload_bits_this_scale = 0
+
+            if plan["unit_mode"] == "channel":
+                kept_channels = [int(x) for x in plan.get("kept_channels", [])]
+                kept_tensor = torch.tensor(kept_channels, device=prob0.device, dtype=torch.long)
+                if kept_channels:
+                    for pos in range(L):
+                        gt_token = gt_flat[0, pos, kept_tensor].tolist()
+                        prob0_token = prob0[0, pos, kept_tensor].detach().cpu().tolist()
+                        payload, flag, bit_len = _encode_token(gt_token, prob0_token)
+                        payloads.append(payload)
+                        flags.append(flag)
+                        payload_bits_this_scale += int(bit_len)
+                    rec_bits[:, :, kept_tensor] = gt_flat[:, :, kept_tensor]
             else:
-                arithmetic_bits.append(gt_idx[j*args.vae_type:(j+1)*args.vae_type])
-                hbits.append(0)
-                sum_len += args.vae_type
-        trans_list.append(arithmetic_bits)
-        help_list.append(hbits)
-        sum_len += len(hbits)
-        bpp = sum_len/1024/1024
-        bpp_list.append(bpp)
+                kept_pos = plan.get("kept_pos", torch.zeros((0,), device=prob0.device, dtype=torch.long))
+                if kept_pos.numel() > 0:
+                    for pos in kept_pos.tolist():
+                        gt_token = gt_flat[0, pos, :d_eff].tolist()
+                        prob0_token = prob0[0, pos, :d_eff].detach().cpu().tolist()
+                        payload, flag, bit_len = _encode_token(gt_token, prob0_token)
+                        payloads.append(payload)
+                        flags.append(flag)
+                        payload_bits_this_scale += int(bit_len)
+                    rec_bits.index_copy_(1, kept_pos, gt_flat[:, kept_pos, :])
 
-    return trans_list, help_list, bpp
+            rec_bits = fill_pruned_positions(
+                rec_bits,
+                keep_mask=plan["keep_mask"],
+                fill_mode=codec_cfg["fill_mode"],
+                prev_bits=prev_bits,
+                prev_hw=prev_hw,
+                out_hw=(Hs, Ws),
+            )
+            advance_progressive_context(ctx, vae, si, rec_bits)
+            prev_bits = rec_bits.detach()
+            prev_hw = (Hs, Ws)
 
-# def encoding(args, infinity, vae, scale_schedule, text, text_tokenizer, text_encoder, gt_ms_idx_Bl):
-#     prob_list = get_prob(infinity, vae, scale_schedule, text, text_tokenizer, text_encoder, gt_ms_idx_Bl)
-#     trans_list = []
-#     help_list = []
-#     bpp_list = []
+            side_bits_this_scale = len(flags) * int(codec_cfg["flag_bits"])
+            total_bits_this_scale = int(payload_bits_this_scale + side_bits_this_scale)
+            cumulative_bits += total_bits_this_scale
+            cumulative_total_bits.append(int(cumulative_bits))
 
-#     # ================= 新增：自适应 Mask 核心配置 =================
-#     START_SCALE = 8         # 从第几个尺度开始启用截断
-#     ENTROPY_THRESHOLD = 12.0 # 信息熵阈值
+            trans_list.append(payloads)
+            help_list.append(flags)
+            scale_stats.append(
+                {
+                    "scale_idx": int(si),
+                    "hw": [Hs, Ws],
+                    "d_eff": int(d_eff),
+                    "unit_mode": str(plan["unit_mode"]),
+                    "num_payload_units": int(len(payloads)),
+                    "payload_bits": int(payload_bits_this_scale),
+                    "side_bits": int(side_bits_this_scale),
+                    "total_bits": int(total_bits_this_scale),
+                    "keep_ratio_in_scale": float(plan["keep_mask"].float().mean().item()),
+                    "fill_mode": str(codec_cfg["fill_mode"]),
+                    "diag": plan.get("diag"),
+                }
+            )
+    finally:
+        cleanup_progressive_context(ctx)
 
-#     sum_len = 0
-#     for i in range(len(gt_ms_idx_Bl)):
-#         gt_idx = gt_ms_idx_Bl[i]
-#         prob = prob_list[i][:,0].cpu().tolist()
-#         gt_idx = gt_idx.view(-1,1).squeeze().cpu().tolist()
-#         arithmetic_bits = []
-#         hbits = []
-        
-#         for j in range(int(len(prob)/args.vae_type)):
-#             p_token = prob[j*args.vae_type:(j+1)*args.vae_type]
-#             gt_token = gt_idx[j*args.vae_type:(j+1)*args.vae_type]
-            
-#             # --- 核心：安全掩码逻辑 ---
-#             is_safe_to_mask = False
-#             if i >= START_SCALE:
-#                 token_entropy = calc_token_entropy(p_token)
-#                 if token_entropy < ENTROPY_THRESHOLD:
-#                     # 关键新增：模拟接收端，检查 Argmax 是否完美命中 Ground Truth
-#                     argmax_token = [0 if p > 0.5 else 1 for p in p_token]
-#                     if argmax_token == gt_token:
-#                         is_safe_to_mask = True # 只有完美命中，才敢不传！
-            
-#             if is_safe_to_mask:
-#                 hbits.append(2) # 暗号 2：安全丢弃，让接收端自行脑补
-#                 # 注意：这里千万不要往 arithmetic_bits 追加任何东西，这部分码率彻底省下了！
-#             else:
-#                 bits = compress_to_bit_list(gt_token, p_token)
-#                 if len(bits) < args.vae_type:
-#                     arithmetic_bits.append(bits)
-#                     hbits.append(0)
-#                 else:
-#                     arithmetic_bits.append(gt_token)
-#                     hbits.append(1)
-                    
-#         trans_list.append(arithmetic_bits)
-#         help_list.append(hbits)
+    packet_meta = {
+        "mask_strategy": codec_cfg["mask_strategy"],
+        "mask_params": codec_cfg["mask_params"],
+        "k_transmit": int(codec_cfg["k_transmit"]),
+        "active_bits_spec": codec_cfg["active_bits_spec"],
+        "active_bits": codec_cfg["active_bits"],
+        "flag_bits": int(codec_cfg["flag_bits"]),
+        "fixed_hw": list(codec_cfg["fixed_hw"]),
+        "fill_mode": str(codec_cfg["fill_mode"]),
+        "scale_stats": scale_stats,
+        "cumulative_total_bits": cumulative_total_bits,
+        "bpp_list": cumulative_total_bits,
+    }
+    if global_stats is not None:
+        packet_meta["global_stats"] = global_stats
 
-#     return trans_list, help_list, bpp_list
+    return trans_list, help_list, packet_meta

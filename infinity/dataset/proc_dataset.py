@@ -34,6 +34,27 @@ def load_image_to_tensor(img_path: str, size: int) -> torch.Tensor:
         return ten
 
 
+def load_condition_to_tensor(cond_path: str, size: int) -> torch.Tensor:
+    path = str(cond_path)
+    if path.lower().endswith(".npy"):
+        arr = np.load(path)
+    else:
+        with Image.open(path) as im:
+            im = _pil_resize_shorter_side(im, size)
+            im = _pil_center_crop(im, size)
+            arr = np.asarray(im)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    arr = arr.astype(np.float32)
+    if arr.size == 0:
+        raise ValueError(f"Empty condition map: {cond_path}")
+    mx = float(arr.max())
+    if mx > 1.0:
+        arr = arr / (65535.0 if mx > 255.0 else 255.0)
+    arr = np.clip(arr, 0.0, 1.0)
+    return torch.from_numpy(arr).unsqueeze(0).contiguous()
+
+
 class ShardEmbeddingReader:
     def __init__(self, proc_dir: str):
         self.proc_dir = Path(proc_dir)
@@ -67,7 +88,14 @@ class ProcessedJsonlDataset(Dataset):
       samples.jsonl + samples_offsets.pt + shards/*
     This avoids loading millions of json lines into memory.
     """
-    def __init__(self, proc_dir: str, res_list: List[int], seed: int = 0):
+    def __init__(
+        self,
+        proc_dir: str,
+        res_list: List[int],
+        seed: int = 0,
+        condition_path_key: str = "",
+        condition_root: str = "",
+    ):
         super().__init__()
         self.proc_dir = Path(proc_dir)
         self.samples_path = self.proc_dir / "samples.jsonl"
@@ -80,6 +108,8 @@ class ProcessedJsonlDataset(Dataset):
         self.res_list = list(res_list)
         self.rng = random.Random(seed)
         self.reader = ShardEmbeddingReader(proc_dir)
+        self.condition_path_key = str(condition_path_key or "")
+        self.condition_root = Path(condition_root) if condition_root else self.proc_dir
 
         self.offsets = torch.load(self.offsets_path, map_location="cpu").long()
         self._fh = None  # lazy open per worker
@@ -108,7 +138,16 @@ class ProcessedJsonlDataset(Dataset):
         img = load_image_to_tensor(img_path, res)
 
         kv, le = self.reader.get(shard_id, local_idx)
-        return {"img": img, "kv": kv, "len": le}
+        out = {"img": img, "kv": kv, "len": le}
+        if self.condition_path_key:
+            cond_path = rec.get(self.condition_path_key)
+            if not cond_path:
+                raise KeyError(f"Record has no condition_path_key={self.condition_path_key!r}: {rec.keys()}")
+            cond_path = Path(cond_path)
+            if not cond_path.is_absolute():
+                cond_path = self.condition_root / cond_path
+            out["condition"] = load_condition_to_tensor(str(cond_path), res)
+        return out
 
 
 def collate_text_cond_tuple(batch_kv_lens: List[Tuple[torch.Tensor, int]], device: torch.device):

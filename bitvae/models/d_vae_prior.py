@@ -793,7 +793,7 @@ class AutoEncoder(nn.Module):
             full_idx = prefix_scales_dbg.index(len(cum_latents))
             loss_dict["metric/sample_prefix_full_prob"] = sampled_prefix_probs[full_idx].detach()
 
-        # --- DINO distillation (no decoding): align multi-scale latent prefixes to DINO(x) embedding ---
+        # --- DINO distillation: only one sampled prefix scale goes into projector ---
         if self.dino_projector is not None and self.dino_weight > 0 and cum_latents is not None:
             if (global_step % max(1, self.dino_every)) == 0:
                 if self.dino_use_cached and cached_dino_feat is not None:

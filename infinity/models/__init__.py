@@ -4,6 +4,7 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.models.layers import DropPath
 
 from .infinity import Infinity, sample_with_top_k_top_p_also_inplace_modifying_logits_
+from .infinity_patched import Infinity as InfinityPatched 
 
 def _ex_repr(self):
     return ', '.join(

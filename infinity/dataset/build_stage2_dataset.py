@@ -21,7 +21,7 @@ class Stage2DataBundle:
     dataset: Any
 
 
-def collate_proc_with_text_cond(batch: List[Dict[str, Any]]) -> Tuple[torch.Tensor, TextCondTuple]:
+def collate_proc_with_text_cond(batch: List[Dict[str, Any]]):
     imgs = torch.stack([b["img"] for b in batch], dim=0)
 
     kv_list = [b["kv"].contiguous() for b in batch]
@@ -33,7 +33,11 @@ def collate_proc_with_text_cond(batch: List[Dict[str, Any]]) -> Tuple[torch.Tens
         cu[1:] = torch.cumsum(lens, dim=0)
 
     kv_compact = torch.cat([kv.to(dtype=torch.float32) for kv in kv_list], dim=0).contiguous()
-    return imgs, (kv_compact, lens, cu, max_seqlen)
+    text_cond_tuple = (kv_compact, lens, cu, max_seqlen)
+    if "condition" in batch[0]:
+        conds = torch.stack([b["condition"] for b in batch], dim=0)
+        return imgs, text_cond_tuple, conds
+    return imgs, text_cond_tuple
 
 
 def move_text_cond_tuple_to_device(
@@ -59,18 +63,28 @@ def build_stage2_dataloader(
     seed: int = 0,
     prefetch_factor: int = 2,
     memmap_cache_size: int = 1,
+    condition_path_key: str = "",
+    condition_root: str = "",
     distributed: bool = False,
     drop_last: bool = True,
 ) -> Stage2DataBundle:
     dataset_backend = dataset_backend.lower()
     if dataset_backend == "proc":
-        dataset = ProcessedJsonlDataset(proc_dir=proc_dir, res_list=res_list, seed=seed)
+        dataset = ProcessedJsonlDataset(
+            proc_dir=proc_dir,
+            res_list=res_list,
+            seed=seed,
+            condition_path_key=condition_path_key,
+            condition_root=condition_root,
+        )
     elif dataset_backend in {"proc_memmap", "memmap"}:
         dataset = ProcessedJsonlMemmapDataset(
             proc_dir=proc_dir,
             res_list=res_list,
             seed=seed,
             cache_size=memmap_cache_size,
+            condition_path_key=condition_path_key,
+            condition_root=condition_root,
         )
     else:
         raise ValueError(f"Unsupported dataset_backend={dataset_backend!r}; expected 'proc' or 'proc_memmap'.")

@@ -23,7 +23,10 @@ from torch.amp import autocast
 
 from einops import rearrange, reduce, pack, unpack
 
-from einx import get_at
+try:
+    from einx import get_at
+except Exception:
+    get_at = None
 
 from .dynamic_resolution import predefined_HW_Scales_dynamic
 
@@ -788,4 +791,3 @@ class BSQ(Module):
             return ret
 
         return ret, LossBreakdown(persample_entropy, cb_entropy, commit_loss)
-

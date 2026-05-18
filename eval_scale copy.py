@@ -194,7 +194,7 @@ def decompress_modified(args, infinity, vae, scale_schedule, text, text_tokenize
 
 if __name__ == "__main__":
 
-    initial_model_path='/workspace/Infinity_codec/local_output/debug_stage2_student_1024_3/ar-ckpt-giter020K-ep0-iter20000-last.pth'
+    initial_model_path='/workspace/Infinity_codec/local_output/debug_stage2_student_1024_3/ar-ckpt-giter008K-ep0-iter8000-last.pth'
     vae_path='/workspace/Infinity_codec/outputs/bitvae_tok_stage1_dino0.1_8bs_dynamic/checkpoints/model_step_249999.ckpt'
     text_encoder_ckpt = '/workspace/CKPT/flan-t5-xl'
     

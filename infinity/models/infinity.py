@@ -58,13 +58,19 @@ class SharedAdaLin(nn.Linear):
 class MultipleLayers(nn.Module):
     def __init__(self, ls, num_blocks_in_a_chunk, index):
         super().__init__()
+        self.index = int(index)
         self.module = nn.ModuleList()
         for i in range(index, index+num_blocks_in_a_chunk):
             self.module.append(ls[i])
 
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None):
+    def forward(
+        self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None,
+        checkpointing_full_block=False, rope2d_freqs_grid=None, condition_adapter=None, condition_tokens=None,
+    ):
         h = x
-        for m in self.module:
+        for local_idx, m in enumerate(self.module):
+            if condition_adapter is not None and condition_tokens is not None:
+                h = h + condition_adapter(condition_tokens, self.index + local_idx, dtype=h.dtype, scale_schedule=scale_schedule)
             if checkpointing_full_block:
                 h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
@@ -347,7 +353,14 @@ class Infinity(nn.Module):
         patch_t, patch_h, patch_w = scale_schedule[scale_ind]
         t_mul_h_mul_w = patch_t * patch_h * patch_w
         assert t_mul_h_mul_w + need_to_pad == seq_len
-        feature[:, :t_mul_h_mul_w] += self.lvl_embed(scale_ind*torch.ones((bs, t_mul_h_mul_w),dtype=torch.int).to(feature.device))
+        if not (0 <= int(scale_ind) < self.lvl_embed.num_embeddings):
+            raise IndexError(
+                f"scale_ind={scale_ind} is out of range for lvl_embed with "
+                f"num_embeddings={self.lvl_embed.num_embeddings}; "
+                f"len(scale_schedule)={len(scale_schedule)}"
+            )
+        lvl_idx = torch.full((bs, t_mul_h_mul_w), int(scale_ind), dtype=torch.long, device=feature.device)
+        feature[:, :t_mul_h_mul_w] += self.lvl_embed(lvl_idx)
         return feature
     
     def add_lvl_embeding_for_x_BLC(self, x_BLC, scale_schedule, need_to_pad=0):
@@ -366,6 +379,10 @@ class Infinity(nn.Module):
 
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
         cfg_infer=False,
+        condition_input: Optional[torch.Tensor] = None,
+        condition_features: Optional[torch.Tensor] = None,
+        return_condition_aux: bool = False,
+        condition_image_hw: Optional[Tuple[int, int]] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
         """
@@ -373,7 +390,14 @@ class Infinity(nn.Module):
         :return: logits BLV, V is vocab_size
         """
         if cfg_infer:
-            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
+            return self.autoregressive_infer_cfg(
+                label_B_or_BLT=label_B_or_BLT,
+                scale_schedule=scale_schedule,
+                condition_input=condition_input,
+                condition_features=condition_features,
+                condition_image_hw=condition_image_hw,
+                **kwargs,
+            )
         
         x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         B = x_BLC_wo_prefix.shape[0]
@@ -423,6 +447,16 @@ class Infinity(nn.Module):
                     attn_bias[0, 0, l_end:, 0] = 0
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 attn_bias_or_two_vector = attn_bias.type_as(x_BLC).to(x_BLC.device)
+
+            condition_aux = None
+            condition_tokens = None
+            condition_codec = getattr(self, 'condition_codec', None)
+            condition_adapter = getattr(self, 'condition_adapter', None)
+            if condition_features is not None and condition_adapter is not None:
+                condition_tokens = condition_adapter.make_tokens(condition_features, scale_schedule, need_to_pad=need_to_pad)
+            elif condition_input is not None and condition_codec is not None and condition_adapter is not None:
+                condition_aux = condition_codec(condition_input, image_hw=condition_image_hw)
+                condition_tokens = condition_adapter.make_tokens(condition_aux["features"], scale_schedule, need_to_pad=need_to_pad)
         
         if self.use_flex_attn:
             attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
@@ -438,6 +472,8 @@ class Infinity(nn.Module):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
+                if condition_tokens is not None:
+                    x_BLC = x_BLC + condition_adapter(condition_tokens, i, dtype=x_BLC.dtype, scale_schedule=scale_schedule)
                 if checkpointing_full_block:
                     x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
                 else:
@@ -448,10 +484,20 @@ class Infinity(nn.Module):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
+                x_BLC = chunk(
+                    x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
+                    attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn,
+                    scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block,
+                    rope2d_freqs_grid=self.rope2d_freqs_grid,
+                    condition_adapter=condition_adapter,
+                    condition_tokens=condition_tokens,
+                )
 
         # [3. unpad the seqlen dim, and then get logits]
-        return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
+        logits = self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
+        if return_condition_aux:
+            return logits, condition_aux
+        return logits
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
@@ -469,6 +515,9 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
+        condition_input: Optional[torch.Tensor] = None,
+        condition_features: Optional[torch.Tensor] = None,
+        condition_image_hw: Optional[Tuple[int, int]] = None,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -509,6 +558,16 @@ class Infinity(nn.Module):
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+        condition_codec = getattr(self, 'condition_codec', None)
+        condition_adapter = getattr(self, 'condition_adapter', None)
+        if condition_features is not None and condition_adapter is not None:
+            if bs != B:
+                condition_features = condition_features.repeat(bs // B, 1, 1, 1)
+        elif condition_input is not None and condition_codec is not None and condition_adapter is not None:
+            condition_aux = condition_codec(condition_input, image_hw=condition_image_hw)
+            condition_features = condition_aux["features"]
+            if bs != B:
+                condition_features = condition_features.repeat(bs // B, 1, 1, 1)
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
 
@@ -549,6 +608,9 @@ class Infinity(nn.Module):
                 # if need_to_pad:
                 #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
+            condition_scale_tokens = None
+            if condition_features is not None and condition_adapter is not None:
+                condition_scale_tokens = condition_adapter.make_scale_tokens(condition_features, pn, need_to_pad=need_to_pad)
 
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             layer_idx = 0
@@ -560,6 +622,8 @@ class Infinity(nn.Module):
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 
                 for m in b.module:
+                    if condition_scale_tokens is not None:
+                        last_stage = last_stage + condition_adapter(condition_scale_tokens, layer_idx, dtype=last_stage.dtype, scale_id=si)
                     last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')

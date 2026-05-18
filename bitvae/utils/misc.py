@@ -8,7 +8,10 @@ import random
 
 import math
 import numpy as np
-import skvideo.io
+try:
+    import skvideo.io
+except Exception:
+    skvideo = None
 from einops import rearrange
 import torch.optim as optim
 
@@ -59,4 +62,3 @@ def get_last_ckpt(root_dir):
     if len(iter_list) == 0: return None
     max_iter = max(iter_list)
     return ckpt_files[max_iter]
-

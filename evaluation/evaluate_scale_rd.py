@@ -1,7 +1,6 @@
 import sys
 import csv
 import json
-import math
 import argparse
 import tqdm
 import torch
@@ -17,14 +16,18 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from neuralcompression.metrics import update_patch_fid
 
 IMG_GLOB = "*.[jpJP][pnPN]*[gG]"  # jpg/jpeg/png (case-insensitive)
+NO_REF_METRICS = ["clipiqa", "musiq", "niqe", "maniqa"]
 
 DEFAULT_PALETTE = [
     "#6baed6", "#9ecae1", "#c6dbef", "#3182bd", "#08519c",
     "#74c476", "#31a354", "#006d2c", "#fd8d3c", "#e6550d",
 ]
 
+
 def _list_images(folder: Path):
     return sorted([x for x in folder.glob(IMG_GLOB)])
+
+
 
 def _build_stem_map(paths):
     m = {}
@@ -32,9 +35,21 @@ def _build_stem_map(paths):
         m[p.stem] = p
     return m
 
+
+
+def _create_no_ref_metrics(device):
+    metrics = {}
+    for name in NO_REF_METRICS:
+        try:
+            metrics[name] = pyiqa.create_metric(name).to(device)
+        except Exception as e:
+            print(f"[Warn] failed to create no-ref metric '{name}': {e}")
+    return metrics
+
+
 @torch.no_grad()
 def evaluate_one(recon_dir: Path, gt_dir: Path, ntest=None, device="cuda", fid_min_pairs=51):
-    device = torch.device(device)
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
     totensor = ToTensor()
 
     recon_dir = Path(recon_dir)
@@ -63,6 +78,7 @@ def evaluate_one(recon_dir: Path, gt_dir: Path, ntest=None, device="cuda", fid_m
             f"(Matched by filename stem.)"
         )
 
+    metric_single = _create_no_ref_metrics(device)
     metric_paired = {
         "psnr": pyiqa.create_metric("psnr").to(device),
         "dists": pyiqa.create_metric("dists").to(device),
@@ -88,6 +104,10 @@ def evaluate_one(recon_dir: Path, gt_dir: Path, ntest=None, device="cuda", fid_m
         recon_tensor = totensor(image_recon).unsqueeze(0).to(device)
         gt_tensor = totensor(image_gt).unsqueeze(0).to(device)
 
+        for k, metric in metric_single.items():
+            v = float(metric(recon_tensor).item())
+            result_sum[k] = result_sum.get(k, 0.0) + v
+
         update_patch_fid(gt_tensor, recon_tensor, fid_metric=fid_metric, kid_metric=kid_metric)
 
         for k, metric in metric_paired.items():
@@ -105,6 +125,8 @@ def evaluate_one(recon_dir: Path, gt_dir: Path, ntest=None, device="cuda", fid_m
     torch.cuda.empty_cache()
     return out
 
+
+
 def _discover_scale_folders(root: Path, scale_names=None):
     if scale_names is not None and len(scale_names) > 0:
         scales = [root / s for s in scale_names]
@@ -121,6 +143,8 @@ def _discover_scale_folders(root: Path, scale_names=None):
     if len(scales) == 0:
         raise RuntimeError(f"No scale folders found under: {root}")
     return scales
+
+
 
 def _parse_csvs(root: Path):
     bpp_dict = {}
@@ -149,14 +173,22 @@ def _parse_csvs(root: Path):
 
     return bpp_dict, metrics_dict
 
+
+
 def _get_better_metric(eval_val, csv_val, metric_name):
     if eval_val is None and csv_val is None:
         return None
-    if eval_val is None: return csv_val
-    if csv_val is None: return eval_val
-    if metric_name in ["psnr", "ms_ssim"]: return max(eval_val, csv_val)
-    elif metric_name in ["lpips", "dists"]: return min(eval_val, csv_val)
+    if eval_val is None:
+        return csv_val
+    if csv_val is None:
+        return eval_val
+    if metric_name in ["psnr", "ms_ssim", "clipiqa", "musiq", "maniqa"]:
+        return max(eval_val, csv_val)
+    elif metric_name in ["lpips", "dists", "niqe"]:
+        return min(eval_val, csv_val)
     return eval_val
+
+
 
 def insert_into_plot_script(plot_script_path, root_dir_name, entry_dict):
     """联动核心逻辑：分配独占颜色，清洗数据并注入绘图脚本"""
@@ -165,23 +197,20 @@ def insert_into_plot_script(plot_script_path, root_dir_name, entry_dict):
         print(f"\n[Warn] Plot script '{plot_script_path}' not found. Skipping auto-insertion.")
         return
 
-    # 1. 自动命名
     suffix = root_dir_name.split("_")[-1] if "_" in root_dir_name else root_dir_name
     method_name = f"VAR_codec_rauto_{suffix}"
 
     with open(plot_script_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # 防止重复注入
     if f"'{method_name}':" in content or f'"{method_name}":' in content:
         print(f"\n[Info] Method '{method_name}' already exists in {plot_script_path}. Skipping to avoid duplicates.")
         return
 
-    # 2. 自动分配唯一的 Color
     distinct_palette = [
-        "#e6194B", "#3cb44b", "#f58231", "#911eb4", "#42d4f4", 
-        "#f032e6", "#bfef45", "#fabed4", "#469990", "#dcbeff", 
-        "#9A6324", "#800000", "#aaffc3", "#808000", "#ffd8b1", 
+        "#e6194B", "#3cb44b", "#f58231", "#911eb4", "#42d4f4",
+        "#f032e6", "#bfef45", "#fabed4", "#469990", "#dcbeff",
+        "#9A6324", "#800000", "#aaffc3", "#808000", "#ffd8b1",
         "#000075", "#a9a9a9", "#ff0000", "#00ff00", "#0000ff"
     ]
     assigned_color = "#000000"
@@ -190,9 +219,8 @@ def insert_into_plot_script(plot_script_path, root_dir_name, entry_dict):
             assigned_color = c
             break
 
-    # 3. 清洗过滤无效数据点 (去除 None 值防止绘图时维度越界报错)
     valid_indices = [i for i, b in enumerate(entry_dict['bpp']) if b is not None]
-    
+
     final_dict = {
         'bpp': [entry_dict['bpp'][i] for i in valid_indices],
         'color': assigned_color,
@@ -201,15 +229,23 @@ def insert_into_plot_script(plot_script_path, root_dir_name, entry_dict):
         'smooth': False
     }
 
-    metrics_mapping = {'lpips': 'lpips', 'dists': 'dists', 'fid': 'fid', 'psnr': 'psnr', 'ms_ssim': 'ms-ssim'}
+    metrics_mapping = {
+        'lpips': 'lpips',
+        'dists': 'dists',
+        'fid': 'fid',
+        'psnr': 'psnr',
+        'ms_ssim': 'ms-ssim',
+        'clipiqa': 'clipiqa',
+        'musiq': 'musiq',
+        'niqe': 'niqe',
+        'maniqa': 'maniqa',
+    }
     for eval_k, plot_k in metrics_mapping.items():
         if eval_k in entry_dict:
             m_list = [entry_dict[eval_k][i] for i in valid_indices]
-            # 如果某个指标依然存在 None (比如 FID 没算出来), 为了保证绘图维度一致，不将其写入此项的画图字典中
             if None not in m_list and len(m_list) > 0:
                 final_dict[plot_k] = m_list
 
-    # 4. 格式化并注入
     dict_str = json.dumps(final_dict, indent=4).replace("false", "False").replace("true", "True")
     insert_text = f"\n    '{method_name}': {dict_str},\n"
 
@@ -224,9 +260,10 @@ def insert_into_plot_script(plot_script_path, root_dir_name, entry_dict):
         print(f"\n[Error] Could not find 'DATA = {{' in {plot_script_path}.")
 
 
+
 def parse_args(argv):
     p = argparse.ArgumentParser("Evaluate and update RD plot script automatically.")
-    p.add_argument("--root", type=str, default="/workspace/Infinity_codec/results/dynamic_3/DIV2K_dynamic_4000",
+    p.add_argument("--root", type=str, default="/workspace/Infinity_codec/results/no_refiner_eval2_40k/iter_20000",
                    help="Root folder containing scale_X directories.")
     p.add_argument("--gt_dir", type=str, default="/workspace/data/DIV2K_1024",
                    help="Ground-truth folder")
@@ -235,24 +272,30 @@ def parse_args(argv):
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--ntest", type=int, default=None)
     p.add_argument("--fid_min_pairs", type=int, default=51)
-    
-    # 联动绘图脚本的参数
     p.add_argument("--plot_script", type=str, default="/workspace/data/DIV2K_metric_full/div2k_1024_inline copy.py",
                    help="Path to your RD curve plotting script (e.g. plot_rd.py)")
     return p.parse_args(argv)
 
 
+
 def main(argv):
     args = parse_args(argv)
     root = Path(args.root)
-    gt_dir = Path(args.gt_dir)
 
     scale_dirs = _discover_scale_folders(root, args.scales)
     bpp_dict, metrics_dict = _parse_csvs(root)
 
     entry = {
-        "bpp": [], "lpips": [], "dists": [], 
-        "fid": [], "psnr": [], "ms_ssim": []
+        "bpp": [],
+        "lpips": [],
+        "dists": [],
+        "fid": [],
+        "psnr": [],
+        "ms_ssim": [],
+        "clipiqa": [],
+        "musiq": [],
+        "niqe": [],
+        "maniqa": [],
     }
 
     print(f"\n==================== Start Evaluating ====================")
@@ -272,12 +315,16 @@ def main(argv):
             entry["fid"].append(None)
             entry["psnr"].append(csv_m.get("psnr", None))
             entry["ms_ssim"].append(csv_m.get("ms_ssim", None))
+            entry["clipiqa"].append(csv_m.get("clipiqa", None))
+            entry["musiq"].append(csv_m.get("musiq", None))
+            entry["niqe"].append(csv_m.get("niqe", None))
+            entry["maniqa"].append(csv_m.get("maniqa", None))
             continue
 
         res = {}
         try:
             res = evaluate_one(
-                recon_dir=scale_dir, gt_dir=gt_dir, ntest=args.ntest,
+                recon_dir=scale_dir, gt_dir=Path(args.gt_dir), ntest=args.ntest,
                 device=args.device, fid_min_pairs=args.fid_min_pairs,
             )
         except Exception as e:
@@ -295,11 +342,21 @@ def main(argv):
         entry["fid"].append(eval_fid)
         entry["psnr"].append(best_psnr)
         entry["ms_ssim"].append(best_msssim)
+        entry["clipiqa"].append(res.get("clipiqa", None))
+        entry["musiq"].append(res.get("musiq", None))
+        entry["niqe"].append(res.get("niqe", None))
+        entry["maniqa"].append(res.get("maniqa", None))
 
-        print(f"[{scale_dir.name}] bpp={csv_bpp:.6f} | lpips={best_lpips:.5f} | dists={best_dists:.5f} | fid={eval_fid} | psnr={best_psnr:.4f} | ms_ssim={best_msssim:.4f}")
+        print(
+            f"[{scale_dir.name}] bpp={csv_bpp:.6f} | "
+            f"lpips={best_lpips:.5f} | dists={best_dists:.5f} | fid={eval_fid} | "
+            f"psnr={best_psnr:.4f} | ms_ssim={best_msssim:.4f} | "
+            f"clipiqa={res.get('clipiqa', None)} | musiq={res.get('musiq', None)} | "
+            f"niqe={res.get('niqe', None)} | maniqa={res.get('maniqa', None)}"
+        )
 
-    # ===== 执行联动注入 =====
     insert_into_plot_script(args.plot_script, root.name, entry)
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
